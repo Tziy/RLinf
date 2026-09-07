@@ -2,7 +2,6 @@ from pathlib import Path
 
 import yaml
 
-
 CONFIG = (
     Path(__file__).parents[2]
     / "examples/embodiment/config/libero_spatial_ppo_gr00t_n1d7_coupled.yaml"

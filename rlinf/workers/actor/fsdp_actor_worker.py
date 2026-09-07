@@ -24,7 +24,13 @@ from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.advantages import select_gae_values_for_critic_warmup
 from rlinf.algorithms.expert import build_expert_model_config
+from rlinf.algorithms.posthoc_semantic_delay import (
+    build_posthoc_semantic_delay_augmentation,
+    posthoc_replay_selected,
+    posthoc_semantic_consistency_loss,
+)
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
@@ -1381,6 +1387,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "normalize_advantages_by_task requires rollout_task_ids in forward_inputs"
             )
 
+        critic_warmup = self.is_critic_warmup_active()
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1390,7 +1397,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             # the full-update warmup phase use Monte Carlo returns instead;
             # otherwise its early errors are fed back into every advantage and
             # the actor starts from a corrupted on-policy signal.
-            "values": self.rollout_batch.get("prev_values", None),
+            "values": select_gae_values_for_critic_warmup(
+                self.rollout_batch.get("prev_values", None),
+                critic_warmup=critic_warmup,
+            ),
             "prev_logprobs": self.rollout_batch.get("prev_logprobs", None),
             "teacher_logprobs": self.rollout_batch.get("teacher_logprobs", None),
             "num_action_chunks": self.cfg.actor.model.num_action_chunks,
@@ -1414,6 +1424,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        rollout_metrics["actor/critic_warmup_mc_returns"] = float(critic_warmup)
         rollout_metrics.update(self._reward_filter_metrics)
         return rollout_metrics
 
@@ -1629,6 +1640,80 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.is_optimizer_offloaded:
             self.load_optimizer(self.device)
 
+        posthoc_cfg = (
+            self.cfg.algorithm.get("posthoc_semantic_delay_augmentation", {}) or {}
+        )
+        if bool(posthoc_cfg.get("enabled", False)):
+            if self.cfg.algorithm.loss_type != "actor_critic":
+                raise ValueError(
+                    "Posthoc semantic delay augmentation preserves the native "
+                    "actor_critic PPO main loss and cannot be combined with "
+                    f"loss_type={self.cfg.algorithm.loss_type}"
+                )
+            if (
+                SupportedModel(self.cfg.actor.model.model_type)
+                != SupportedModel.GR00T_N1D7
+            ):
+                raise ValueError(
+                    "Posthoc semantic delay augmentation currently supports "
+                    "GR00T N1.7 only"
+                )
+            rl_head_config = self.cfg.actor.model.get("rl_head_config", {})
+            if bool(posthoc_cfg.get("require_nonblocking_rollout", True)):
+                train_exact_age = int(
+                    rl_head_config.get("semantic_train_random_age_max_frames", -1)
+                )
+                if train_exact_age >= 0:
+                    raise ValueError(
+                        "Nonblocking Posthoc semantic delay augmentation forbids "
+                        "exact-age online training; rollout must consume the latest "
+                        "completed packet"
+                    )
+                if bool(
+                    rl_head_config.get("posthoc_semantic_delay_bank_enabled", False)
+                ):
+                    raise ValueError(
+                        "Nonblocking Posthoc semantic delay augmentation consumes "
+                        "rollout-buffer tensors only and forbids fresh-bank fetch"
+                    )
+            posthoc_batch = build_posthoc_semantic_delay_augmentation(
+                self.rollout_batch["forward_inputs"],
+                control_hz=float(rl_head_config.get("semantic_control_hz", 20.0)),
+                delta_frames=tuple(
+                    int(value)
+                    for value in posthoc_cfg.get("delta_frames", [-4, -2, 2, 4, 8])
+                ),
+                seed=int(posthoc_cfg.get("seed", 9473)) + self._rank,
+                global_step=int(self.version),
+                allow_hindsight_completion=bool(
+                    posthoc_cfg.get("allow_hindsight_completion", False)
+                ),
+            )
+            if posthoc_batch["ppo_eligible"].any():
+                raise RuntimeError(
+                    "Posthoc semantic delay rows must never enter the PPO main loss"
+                )
+            self.rollout_batch["posthoc_semantic_delay"] = posthoc_batch
+            valid = posthoc_batch["valid_mask"]
+            older = valid & (
+                posthoc_batch["augmented_age_frames"]
+                > posthoc_batch["original_age_frames"]
+            )
+            fresher = valid & (
+                posthoc_batch["augmented_age_frames"]
+                < posthoc_batch["original_age_frames"]
+            )
+            hindsight = valid & ~posthoc_batch["candidate_was_online_available"]
+            self.logger.info(
+                "Posthoc semantic delay buffer: valid=%d/%d older=%d fresher=%d "
+                "hindsight=%d ppo_eligible=0",
+                int(valid.sum().item()),
+                valid.numel(),
+                int(older.sum().item()),
+                int(fresher.sum().item()),
+                int(hindsight.sum().item()),
+            )
+
         if self.cfg.algorithm.loss_type == "opd":
             target_steps = int(self.rollout_batch["advantages"].shape[0])
             for key in [
@@ -1668,8 +1753,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         metrics = {}
         update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        posthoc_replay_interval = int(posthoc_cfg.get("replay_microbatch_interval", 1))
+        posthoc_replay_offset = int(posthoc_cfg.get("replay_microbatch_offset", 0))
+        # Every FSDP rank sees the same number of global and micro batches, so
+        # this ordinal produces an identical forward schedule on every rank.
+        microbatch_ordinal = 0
 
         def train_epoch() -> None:
+            nonlocal microbatch_ordinal
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
                 rollout_size // batch_size_per_rank,
@@ -1693,11 +1784,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.optimizer.zero_grad()
                 for idx, batch in enumerate(train_micro_batch):
+                    run_posthoc_replay = posthoc_replay_selected(
+                        microbatch_ordinal,
+                        posthoc_replay_interval,
+                        posthoc_replay_offset,
+                    )
                     self.train_micro_batch(
                         micro_batch=batch,
                         metrics=metrics,
                         is_last=(idx + 1) == self.gradient_accumulation,
+                        run_posthoc_replay=run_posthoc_replay,
                     )
+                    microbatch_ordinal += 1
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
                     del batch
@@ -1740,6 +1838,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics: dict[str, list[float]],
         *,
         is_last: bool,
+        run_posthoc_replay: bool = True,
     ) -> None:
         micro_batch = put_tensor_device(micro_batch, self.device)
         backward_ctx = self.before_micro_batch(self.model, is_last_micro_batch=is_last)
@@ -1750,6 +1849,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         loss_mask = micro_batch.get("loss_mask", None)
         loss_mask_sum = micro_batch.get("loss_mask_sum", None)
         forward_inputs = micro_batch.get("forward_inputs", None)
+        action_execution_horizon = int(
+            self.cfg.actor.model.get("rl_head_config", {}).get(
+                "train_execution_horizon", -1
+            )
+        )
 
         kwargs = {}
         if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1804,28 +1908,33 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 single_action_dim=self.cfg.actor.model.get("action_dim", 7),
                 loss_mask=loss_mask,
                 reward_type=self.cfg.algorithm.reward_type,
+                action_execution_horizon=action_execution_horizon,
             )
             ppo_log_ratio = (
                 identity_inputs["logprobs"] - identity_inputs["old_logprobs"]
             )
             ppo_ratio = torch.exp(ppo_log_ratio.clamp(-20.0, 20.0))
-            append_to_dict(metrics, {
-                "identity/logprob_abs_mean": identity_delta.abs().mean().item(),
-                "identity/logprob_abs_max": identity_delta.abs().max().item(),
-                "identity/logprob_delta_mean": identity_delta.mean().item(),
-                "identity/ratio_mean": identity_ratio.mean().item(),
-                "identity/ratio_std": identity_ratio.std().item(),
-                "identity/chunk_logprob_abs_mean": chunk_delta.abs().mean().item(),
-                "identity/chunk_ratio_mean": chunk_ratio.mean().item(),
-                "identity/chunk_ratio_std": chunk_ratio.std().item(),
-                "identity/ppo_logratio_mean": masked_mean(
-                    ppo_log_ratio, identity_inputs["loss_mask"]
-                ).item(),
-                "identity/ppo_ratio_mean": masked_mean(
-                    ppo_ratio, identity_inputs["loss_mask"]
-                ).item(),
-            })
+            append_to_dict(
+                metrics,
+                {
+                    "identity/logprob_abs_mean": identity_delta.abs().mean().item(),
+                    "identity/logprob_abs_max": identity_delta.abs().max().item(),
+                    "identity/logprob_delta_mean": identity_delta.mean().item(),
+                    "identity/ratio_mean": identity_ratio.mean().item(),
+                    "identity/ratio_std": identity_ratio.std().item(),
+                    "identity/chunk_logprob_abs_mean": chunk_delta.abs().mean().item(),
+                    "identity/chunk_ratio_mean": chunk_ratio.mean().item(),
+                    "identity/chunk_ratio_std": chunk_ratio.std().item(),
+                    "identity/ppo_logratio_mean": masked_mean(
+                        ppo_log_ratio, identity_inputs["loss_mask"]
+                    ).item(),
+                    "identity/ppo_ratio_mean": masked_mean(
+                        ppo_ratio, identity_inputs["loss_mask"]
+                    ).item(),
+                },
+            )
 
+        critic_warmup = self.is_critic_warmup_active()
         loss_kwargs = {
             "loss_type": self.cfg.algorithm.loss_type,
             "logprob_type": self.cfg.algorithm.logprob_type,
@@ -1839,13 +1948,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "prev_values": prev_values,
             "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
             "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-            "value_clip": self.cfg.algorithm.get("value_clip", None),
+            "value_clip": (
+                None if critic_warmup else self.cfg.algorithm.get("value_clip", None)
+            ),
             "huber_delta": self.cfg.algorithm.get("huber_delta", None),
             "loss_mask": loss_mask,
             "loss_mask_sum": loss_mask_sum,
             "max_episode_steps": self.cfg.env.train.max_episode_steps,
             "task_type": self.cfg.runner.task_type,
-            "critic_warmup": self.is_critic_warmup_active(),
+            "critic_warmup": critic_warmup,
+            "action_execution_horizon": action_execution_horizon,
         }
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1880,6 +1992,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 single_action_dim=self.cfg.actor.model.get("action_dim", 7),
                 loss_mask=loss_mask,
                 reward_type=self.cfg.algorithm.reward_type,
+                action_execution_horizon=action_execution_horizon,
             )
             reference_kl = kl_penalty(
                 reference_inputs["logprobs"],
@@ -1901,6 +2014,88 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             entropy_loss = masked_mean(entropy, mask=loss_mask)
             loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
         metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+
+        posthoc_aux_loss = torch.tensor(
+            0.0, device=Worker.torch_platform.current_device()
+        )
+        posthoc_batch = micro_batch.get("posthoc_semantic_delay")
+        posthoc_cfg = (
+            self.cfg.algorithm.get("posthoc_semantic_delay_augmentation", {}) or {}
+        )
+        posthoc_weight = float(posthoc_cfg.get("consistency_loss_weight", 0.0))
+        posthoc_force_replay = bool(posthoc_cfg.get("force_replay_forward", False))
+        posthoc_replay_interval = int(posthoc_cfg.get("replay_microbatch_interval", 1))
+        if posthoc_batch is not None:
+            if posthoc_batch["ppo_eligible"].any():
+                raise RuntimeError(
+                    "Posthoc semantic delay rows are not eligible for PPO"
+                )
+            valid = posthoc_batch["valid_mask"].bool()
+            older = valid & (
+                posthoc_batch["augmented_age_frames"]
+                > posthoc_batch["original_age_frames"]
+            )
+            fresher = valid & (
+                posthoc_batch["augmented_age_frames"]
+                < posthoc_batch["original_age_frames"]
+            )
+            metrics_data["posthoc/valid_fraction"] = valid.float().mean().item()
+            hindsight = valid & ~posthoc_batch["candidate_was_online_available"]
+            metrics_data["posthoc/older_fraction"] = older.float().mean().item()
+            metrics_data["posthoc/fresher_fraction"] = fresher.float().mean().item()
+            metrics_data["posthoc/hindsight_fraction"] = hindsight.float().mean().item()
+            metrics_data["posthoc/ppo_eligible_count"] = 0.0
+            metrics_data["posthoc/replay_selected"] = float(run_posthoc_replay)
+            if valid.any():
+                age_delta = (
+                    posthoc_batch["augmented_age_frames"]
+                    - posthoc_batch["original_age_frames"]
+                )
+                metrics_data["posthoc/age_delta_abs_mean_frames"] = (
+                    age_delta[valid].float().abs().mean().item()
+                )
+            else:
+                metrics_data["posthoc/age_delta_abs_mean_frames"] = 0.0
+
+            if (
+                (posthoc_weight > 0 or posthoc_force_replay)
+                and not critic_warmup
+                and run_posthoc_replay
+            ):
+                augmented_forward_inputs = dict(forward_inputs)
+                augmented_forward_inputs.update(posthoc_batch["replacements"])
+                if augmented_forward_inputs["rollout_posthoc_ppo_eligible"].any():
+                    raise RuntimeError(
+                        "Augmented semantic rows must remain outside the PPO mask"
+                    )
+                with self.amp_context:
+                    augmented_output = self.model(
+                        forward_inputs=augmented_forward_inputs,
+                        compute_logprobs=True,
+                        compute_entropy=False,
+                        compute_values=False,
+                        use_cache=False,
+                        **kwargs,
+                    )
+                posthoc_aux_loss, posthoc_metrics = posthoc_semantic_consistency_loss(
+                    output_dict["logprobs"],
+                    augmented_output["logprobs"],
+                    valid,
+                    loss_mask=loss_mask,
+                    action_execution_horizon=action_execution_horizon,
+                )
+                # A zero-weight compute control executes the same replay
+                # forward and metrics, but must not attach the diffusion
+                # log-prob graph to PPO backward: zero upstream gradients can
+                # still become NaN inside non-finite diffusion tails.
+                if posthoc_weight > 0:
+                    loss += posthoc_weight * posthoc_replay_interval * posthoc_aux_loss
+                metrics_data.update(
+                    {key: value.item() for key, value in posthoc_metrics.items()}
+                )
+        metrics_data["posthoc/weighted_aux_loss"] = (
+            posthoc_weight * posthoc_replay_interval * posthoc_aux_loss.detach().item()
+        )
 
         if self.enable_sft_co_train:
             loss = self._train_sft_epoch(metrics_data, loss)

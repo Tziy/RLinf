@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -134,6 +136,42 @@ class EmbodiedRunner:
             acceptance_cfg.get("max_task_drop", 1.0)
         )
         self.accepted_eval_metrics: dict = {}
+        early_stop_cfg = self.cfg.runner.get("success_early_stop", {})
+        self.success_early_stop_enabled = bool(
+            early_stop_cfg.get("enabled", False)
+        )
+        self.success_early_stop_metric = str(
+            early_stop_cfg.get("metric", "eval/success_once")
+        )
+        self.success_early_stop_threshold = float(
+            early_stop_cfg.get("threshold", 0.75)
+        )
+        self.success_early_stop_band_low = float(
+            early_stop_cfg.get("desired_band_low", 0.75)
+        )
+        self.success_early_stop_band_high = float(
+            early_stop_cfg.get("desired_band_high", 0.85)
+        )
+        self.success_early_stop_protocol_label = str(
+            early_stop_cfg.get("protocol_label", "development")
+        )
+        self._last_saved_checkpoint_step: int | None = None
+        self._last_saved_checkpoint_dir: str | None = None
+        if self.success_early_stop_enabled:
+            if self.cfg.runner.val_check_interval <= 0:
+                raise ValueError(
+                    "success_early_stop requires runner.val_check_interval > 0"
+                )
+            if not (
+                0.0 <= self.success_early_stop_band_low
+                <= self.success_early_stop_threshold
+                <= self.success_early_stop_band_high
+                <= 1.0
+            ):
+                raise ValueError(
+                    "success_early_stop requires 0 <= desired_band_low <= "
+                    "threshold <= desired_band_high <= 1"
+                )
 
         # Async logging setup
         self.stop_logging = False
@@ -327,7 +365,7 @@ class EmbodiedRunner:
         training_metrics = [result.get("training_metrics", {}) for result in results]
         return rollout_metrics, training_metrics
 
-    def _maybe_eval_and_checkpoint(self, step: int) -> dict:
+    def _maybe_eval_and_checkpoint(self) -> dict:
         run_val, save_model, _ = check_progress(
             self.global_step,
             self.max_steps,
@@ -343,7 +381,7 @@ class EmbodiedRunner:
                 self.update_rollout_weights()
                 eval_metrics = self.evaluate()
                 eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-                self.metric_logger.log(data=eval_metrics, step=step)
+                self.metric_logger.log(data=eval_metrics, step=self.global_step)
 
         best_metric_value = None
         if self.update_acceptance_enabled:
@@ -383,7 +421,7 @@ class EmbodiedRunner:
                 ),
             }
             eval_metrics.update(gate_metrics)
-            self.metric_logger.log(data=gate_metrics, step=step)
+            self.metric_logger.log(data=gate_metrics, step=self.global_step)
 
             if update_accepted:
                 checkpoint_dir = self._save_checkpoint()
@@ -441,6 +479,85 @@ class EmbodiedRunner:
                     )
 
         return eval_metrics
+
+    def _maybe_request_success_early_stop(self, eval_metrics: dict) -> bool:
+        """Stop at the first fixed evaluation crossing the preregistered threshold."""
+        if not self.success_early_stop_enabled or not eval_metrics:
+            return False
+        if self.success_early_stop_metric not in eval_metrics:
+            raise KeyError(
+                "Early-stop metric "
+                f"{self.success_early_stop_metric!r} missing from evaluation"
+            )
+
+        metric_value = float(eval_metrics[self.success_early_stop_metric])
+        if not math.isfinite(metric_value):
+            raise ValueError(
+                f"Early-stop metric is not finite: {self.success_early_stop_metric}="
+                f"{metric_value}"
+            )
+        if metric_value < self.success_early_stop_threshold:
+            return False
+
+        if self._last_saved_checkpoint_step == self.global_step:
+            checkpoint_dir = self._last_saved_checkpoint_dir
+        else:
+            checkpoint_dir = self._save_checkpoint()
+        assert checkpoint_dir is not None
+
+        within_band = (
+            self.success_early_stop_band_low
+            <= metric_value
+            <= self.success_early_stop_band_high
+        )
+        stop_metrics = {
+            "runner/success_early_stop_triggered": 1.0,
+            "runner/success_early_stop_within_desired_band": float(within_band),
+            "runner/success_early_stop_overshoot": float(
+                metric_value > self.success_early_stop_band_high
+            ),
+        }
+        eval_metrics.update(stop_metrics)
+        self.metric_logger.log(data=stop_metrics, step=self.global_step)
+
+        record = {
+            "schema_version": 1,
+            "protocol_label": self.success_early_stop_protocol_label,
+            "selection_role": "development_only",
+            "rule": "first_fixed_evaluation_at_or_above_threshold",
+            "global_step": self.global_step,
+            "metric": self.success_early_stop_metric,
+            "metric_value": metric_value,
+            "threshold": self.success_early_stop_threshold,
+            "desired_band": [
+                self.success_early_stop_band_low,
+                self.success_early_stop_band_high,
+            ],
+            "within_desired_band": within_band,
+            "overshoot": metric_value > self.success_early_stop_band_high,
+            "checkpoint_dir": checkpoint_dir,
+            "max_steps": self.max_steps,
+            "val_check_interval": self.cfg.runner.val_check_interval,
+        }
+        record_path = os.path.join(
+            self.cfg.runner.logger.log_path, "development_success_early_stop.json"
+        )
+        os.makedirs(os.path.dirname(record_path), exist_ok=True)
+        with open(record_path, "w", encoding="utf-8") as file:
+            json.dump(record, file, indent=2, sort_keys=True)
+            file.write("\n")
+        self.logger.info(
+            "Development success early stop at step %d: %s=%.6f, "
+            "desired_band=[%.6f, %.6f], within_band=%s, checkpoint=%s",
+            self.global_step,
+            self.success_early_stop_metric,
+            metric_value,
+            self.success_early_stop_band_low,
+            self.success_early_stop_band_high,
+            within_band,
+            checkpoint_dir,
+        )
+        return True
 
     def _log_step_metrics(
         self,
@@ -624,6 +741,9 @@ class EmbodiedRunner:
                     "Saved initial accepted checkpoint %s",
                     self.best_checkpoint_dir,
                 )
+            if self._maybe_request_success_early_stop(initial_eval_metrics):
+                self._finish_run()
+                return
 
         for _step in range(start_step, self.max_steps):
             # set global step
@@ -686,7 +806,10 @@ class EmbodiedRunner:
                         env_bootstrap_handle.wait()
 
                 self.global_step += 1
-                eval_metrics = self._maybe_eval_and_checkpoint(_step)
+                eval_metrics = self._maybe_eval_and_checkpoint()
+                success_early_stop = self._maybe_request_success_early_stop(
+                    eval_metrics
+                )
 
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
@@ -703,6 +826,8 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
+            if success_early_stop:
+                break
 
         self._finish_run()
 
@@ -765,7 +890,10 @@ class EmbodiedRunner:
                     env_bootstrap_handle.wait()
 
                 self.global_step += 1
-                eval_metrics = self._maybe_eval_and_checkpoint(_step)
+                eval_metrics = self._maybe_eval_and_checkpoint()
+                success_early_stop = self._maybe_request_success_early_stop(
+                    eval_metrics
+                )
 
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
@@ -782,6 +910,8 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
+            if success_early_stop:
+                break
 
         self._finish_run()
 
@@ -795,6 +925,8 @@ class EmbodiedRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        self._last_saved_checkpoint_step = self.global_step
+        self._last_saved_checkpoint_dir = base_output_dir
         return base_output_dir
 
     def set_max_steps(self):

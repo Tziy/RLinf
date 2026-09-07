@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import json
+import os
+from pathlib import Path
 
 import hydra
 import torch.multiprocessing as mp
@@ -23,6 +25,7 @@ from rlinf.config import validate_cfg
 from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
+from rlinf.utils.fdvla_run_metadata import save_effective_config
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.reward import EmbodiedAPIRewardWorker, EmbodiedRewardWorker
@@ -33,11 +36,20 @@ mp.set_start_method("spawn", force=True)
 _REWARD_SERVER_COMPONENT_NAME = "reward_server"
 
 
+def _should_launch_reward_worker(reward_cfg) -> bool:
+    """Return the single gate used for all external reward-worker launches."""
+    return bool(reward_cfg.get("use_reward_model", False)) and not bool(
+        reward_cfg.get("standalone_realworld", False)
+    )
+
+
 @hydra.main(
     version_base="1.1", config_path="config", config_name="maniskill_ppo_openvlaoft"
 )
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
+    if metadata_dir := os.environ.get("FDVLA_METADATA_DIR"):
+        save_effective_config(cfg, Path(metadata_dir))
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(
@@ -135,8 +147,12 @@ def main(cfg) -> None:
     reward_group = None
     reward_cfg = cfg.get("reward", {})
     api_base = str(reward_cfg.get("api", {}).get("api_base") or "").strip()
+    launch_reward_worker = _should_launch_reward_worker(reward_cfg)
+    if not launch_reward_worker:
+        print("Reward Worker disabled; reward-model invocation count: 0")
+
     if (
-        reward_cfg.get("use_reward_model", False)
+        launch_reward_worker
         and str(reward_cfg.get("worker_type", "model")).lower() == "api"
         and not api_base
     ):
@@ -156,9 +172,7 @@ def main(cfg) -> None:
                 cfg.reward.api = {}
             cfg.reward.api.api_base = api_base
 
-    if reward_cfg.get("use_reward_model", False) and not reward_cfg.get(
-        "standalone_realworld", False
-    ):
+    if launch_reward_worker:
         reward_placement = component_placement.get_strategy("reward")
         reward_worker_cls = (
             EmbodiedAPIRewardWorker

@@ -20,6 +20,9 @@ DIT_GPU_IDS=${DIT_GPU_IDS:-1,2,3,4,5,6,7}
 # external semantic servers colocate with idle actor ranks while rollout
 # workers remain on dedicated GPUs.
 ACTOR_GPU_IDS=${ACTOR_GPU_IDS:-${DIT_GPU_IDS}}
+# Optional independent simulator/render placement. When unset, preserve the
+# historical behavior of colocating environment workers with DiT workers.
+ENV_GPU_IDS=${ENV_GPU_IDS:-}
 SEMANTIC_BATCH_WAIT_MS=${SEMANTIC_BATCH_WAIT_MS:-0}
 SEMANTIC_RPC_BATCH_WAIT_MS=${SEMANTIC_RPC_BATCH_WAIT_MS:-2}
 export ACTION_CHUNK_SIZE=${ACTION_CHUNK_SIZE:-16}
@@ -122,6 +125,27 @@ fi
 if (( MAX_DIT_GPUS > 0 && MAX_DIT_GPUS < ${#DIT_GPUS[@]} )); then
     DIT_GPUS=( "${DIT_GPUS[@]:0:MAX_DIT_GPUS}" )
 fi
+if [[ -n "${ENV_GPU_IDS}" ]]; then
+    IFS=, read -r -a ENV_GPUS <<<"${ENV_GPU_IDS}"
+else
+    ENV_GPUS=( "${DIT_GPUS[@]}" )
+fi
+declare -A ENV_GPU_SEEN=()
+for selected_gpu in "${ENV_GPUS[@]}"; do
+    if [[ -n "${ENV_GPU_SEEN[$selected_gpu]:-}" ]]; then
+        echo "Duplicate environment GPU ${selected_gpu}." >&2
+        exit 1
+    fi
+    ENV_GPU_SEEN[$selected_gpu]=1
+    if [[ ! " ${ALLOWED_GPUS[*]} " =~ " ${selected_gpu} " ]]; then
+        echo "Requested environment GPU ${selected_gpu} is outside ALLOWED_GPU_IDS=${ALLOWED_GPU_IDS}." >&2
+        exit 1
+    fi
+    if [[ ! " ${FREE_GPUS[*]} " =~ " ${selected_gpu} " ]]; then
+        echo "Requested environment GPU ${selected_gpu} is not free." >&2
+        exit 1
+    fi
+done
 DIT_GPU_CSV=$(IFS=,; echo "${DIT_GPUS[*]}")
 if (( ${#ACTOR_GPUS[@]} < 1 )); then
     echo "ACTOR_GPU_IDS must contain at least one GPU." >&2
@@ -131,7 +155,7 @@ fi
 # RLinf requires resource ranks in each placement string to be ascending.
 # Keep physical GPU ranks identical to RLinf resource ranks, including semantic-only GPUs.
 mapfile -t WORKLOAD_GPUS < <(
-    printf '%s\n' "${SEMANTIC_GPUS[@]}" "${ACTOR_GPUS[@]}" "${DIT_GPUS[@]}" | sort -n -u
+    printf '%s\n' "${SEMANTIC_GPUS[@]}" "${ACTOR_GPUS[@]}" "${DIT_GPUS[@]}" "${ENV_GPUS[@]}" | sort -n -u
 )
 WORKLOAD_GPU_CSV=$(IFS=,; echo "${WORKLOAD_GPUS[*]}")
 declare -A WORKLOAD_LOCAL_RANK=()
@@ -167,15 +191,18 @@ for gpu_index in "${!DIT_GPUS[@]}"; do
     ROLLOUT_GPU_PLACEMENT+="${WORKLOAD_LOCAL_RANK[${DIT_GPUS[$gpu_index]}]}:${rank_spec}"
 done
 export ROLLOUT_GPU_PLACEMENT
-ENV_WORKERS_PER_PHYSICAL_GPU=$((ENV_WORKERS_PER_GPU * DIT_REPLICAS_PER_GPU))
-ENV_WORLD_SIZE=$(( ${#DIT_GPUS[@]} * ENV_WORKERS_PER_PHYSICAL_GPU ))
+ENV_WORKERS_PER_PHYSICAL_GPU=${ENV_WORKERS_PER_GPU}
+if [[ -z "${ENV_GPU_IDS}" ]]; then
+    ENV_WORKERS_PER_PHYSICAL_GPU=$((ENV_WORKERS_PER_GPU * DIT_REPLICAS_PER_GPU))
+fi
+ENV_WORLD_SIZE=$(( ${#ENV_GPUS[@]} * ENV_WORKERS_PER_PHYSICAL_GPU ))
 # Process one rollout-rank packet at a time. Merging all ranks into one large
 # VLM forward improves nominal batching but makes every environment wait for
 # the slowest packet and materially increases semantic age.
 SEMANTIC_BATCH_MAX_REQUESTS=${SEMANTIC_BATCH_MAX_REQUESTS:-1}
 SEMANTIC_BATCH_TARGET_REQUESTS=${SEMANTIC_BATCH_TARGET_REQUESTS:-0}
 ENV_GPU_PLACEMENT=""
-for gpu_index in "${!DIT_GPUS[@]}"; do
+for gpu_index in "${!ENV_GPUS[@]}"; do
     first_rank=$((gpu_index * ENV_WORKERS_PER_PHYSICAL_GPU))
     last_rank=$((first_rank + ENV_WORKERS_PER_PHYSICAL_GPU - 1))
     rank_spec="${first_rank}"
@@ -185,7 +212,7 @@ for gpu_index in "${!DIT_GPUS[@]}"; do
     if [[ -n "${ENV_GPU_PLACEMENT}" ]]; then
         ENV_GPU_PLACEMENT+=","
     fi
-    ENV_GPU_PLACEMENT+="${WORKLOAD_LOCAL_RANK[${DIT_GPUS[$gpu_index]}]}:${rank_spec}"
+    ENV_GPU_PLACEMENT+="${WORKLOAD_LOCAL_RANK[${ENV_GPUS[$gpu_index]}]}:${rank_spec}"
 done
 export ENV_GPU_PLACEMENT
 export TRAIN_NUM_ENVS=$((TARGET_TRAIN_ENVS / ENV_WORLD_SIZE * ENV_WORLD_SIZE))
@@ -264,11 +291,13 @@ export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/rlinf-ray}"
 export RLINF_RAY_TEMP_DIR="${RLINF_RAY_TEMP_DIR:-${RAY_TMPDIR}}"
 export RLINF_FORCE_LOCAL_RAY=1
 mkdir -p "${TMPDIR}" "${RAY_TMPDIR}"
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
+LOG_DIR=${FDVLA_RUN_LOG_DIR:-"${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"}
+export RLINF_LOG_DIR=${RLINF_LOG_DIR:-${LOG_DIR}}
 mkdir -p "${LOG_DIR}"
 
 echo "semantic_gpus=$(IFS=,; echo "${SEMANTIC_GPUS[*]}") semantic_ports=${FETCH_PORT_CSV} semantic_publish_ports=${PUBLISH_PORT_CSV} semantic_internal_publish_ports=${INTERNAL_PUBLISH_PORT_CSV} semantic_preprocess_proxy=${SEMANTIC_PREPROCESS_PROXY} semantic_proxy_cpuset=${SEMANTIC_PROXY_CPUSET:-none} semantic_batch_max_requests=${SEMANTIC_BATCH_MAX_REQUESTS} semantic_batch_target_requests=${SEMANTIC_BATCH_TARGET_REQUESTS} semantic_batch_target_envs=${SEMANTIC_BATCH_TARGET_ENVS} semantic_batch_wait_ms=${SEMANTIC_BATCH_WAIT_MS} semantic_bootstrap_target_envs=${SEMANTIC_BOOTSTRAP_TARGET_ENVS} semantic_bootstrap_wait_ms=${SEMANTIC_BOOTSTRAP_WAIT_MS} semantic_preprocess_workers=${SEMANTIC_PREPROCESS_WORKERS} semantic_omp_threads=${SEMANTIC_OMP_NUM_THREADS} semantic_cpuset=${SEMANTIC_CPUSET:-none} workload_cpuset=${WORKLOAD_CPUSET:-none} semantic_rpc_batch_wait_ms=${SEMANTIC_RPC_BATCH_WAIT_MS} semantic_text_padding_tokens=${SEMANTIC_TEXT_PADDING_TOKENS} rollout_gpus=${DIT_GPU_CSV} actor_gpus=$(IFS=,; echo "${ACTOR_GPUS[*]}") workload_gpus=${WORKLOAD_GPU_CSV} dit_replicas_per_gpu=${DIT_REPLICAS_PER_GPU} actor_placement=${ACTOR_GPU_PLACEMENT} rollout_placement=${ROLLOUT_GPU_PLACEMENT} env_placement=${ENV_GPU_PLACEMENT} rollout_world_size=${ROLLOUT_WORLD_SIZE} env_world_size=${ENV_WORLD_SIZE} train_envs=${TRAIN_NUM_ENVS} global_batch=${PPO_GLOBAL_BATCH_SIZE} semantic_transport_quantization=${SEMANTIC_TRANSPORT_QUANTIZATION}" | tee "${LOG_DIR}/placement.log"
 
+echo "env_gpus=$(IFS=,; echo "${ENV_GPUS[*]}") env_workers_per_gpu=${ENV_WORKERS_PER_PHYSICAL_GPU}" | tee -a "${LOG_DIR}/placement.log"
 SERVER_PIDS=()
 SERVER_LOGS=()
 READY_PATTERNS=()

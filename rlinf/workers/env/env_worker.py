@@ -46,6 +46,15 @@ from rlinf.models.embodiment.gr00t.gr00t_n1d7.eval_noise import (
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
+from rlinf.utils.fdvla_realtime import (
+    fixed_age_publish_frame as _fixed_age_publish_frame,
+)
+from rlinf.utils.fdvla_realtime import (
+    resolve_eval_execution_horizon as _resolve_eval_execution_horizon,
+)
+from rlinf.utils.fdvla_realtime import (
+    resolve_train_execution_horizon as _resolve_train_execution_horizon,
+)
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
@@ -96,6 +105,41 @@ def _validate_semantic_publish_frame(
         )
 
 
+def _should_publish_eval_semantic(
+    mid_chunk_enabled: bool,
+    fixed_age_frames: int,
+    random_age_max_frames: int,
+) -> bool:
+    """Publish the packet selected by an exact-age evaluation schedule."""
+    return bool(
+        mid_chunk_enabled
+        or int(fixed_age_frames) >= 0
+        or int(random_age_max_frames) >= 0
+    )
+
+
+def _pad_executed_chunk(tensor: torch.Tensor, predicted_horizon: int) -> torch.Tensor:
+    """Pad an executed action-prefix result without inventing transitions."""
+    predicted_horizon = int(predicted_horizon)
+    if tensor.ndim != 2:
+        raise ValueError(f"Expected [batch, executed_horizon], got {tensor.shape=}")
+    executed_horizon = int(tensor.shape[1])
+    if not 1 <= executed_horizon <= predicted_horizon:
+        raise ValueError(
+            "Executed chunk must fit within prediction horizon: "
+            f"{executed_horizon=} {predicted_horizon=}"
+        )
+    if executed_horizon == predicted_horizon:
+        return tensor
+    padding = torch.zeros(
+        tensor.shape[0],
+        predicted_horizon - executed_horizon,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    return torch.cat((tensor, padding), dim=1)
+
+
 def _observation_fingerprint(observation: dict[str, Any]) -> str:
     digest = hashlib.sha256()
     for key in sorted(observation):
@@ -109,6 +153,132 @@ def _observation_fingerprint(observation: dict[str, Any]) -> str:
         else:
             digest.update(repr(value).encode("utf-8"))
     return digest.hexdigest()[:16]
+
+
+def _extract_eval_audit_metadata(
+    forward_inputs: dict[str, Any] | None,
+    newly_done: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Select action-boundary audit metadata for episodes completed this chunk."""
+    if not forward_inputs:
+        return {}
+    field_map = {
+        "semantic_age": "rollout_semantic_actual_age_frames",
+        "requested_semantic_age": "rollout_semantic_requested_age_frames",
+        "semantic_age_bootstrap_clipped": "rollout_semantic_bootstrap_clipped",
+        "policy_noise_seed": "rollout_policy_noise_seeds",
+        "action_execution_horizon": "rollout_action_execution_horizon",
+    }
+    done_mask = newly_done.detach().to(device="cpu", dtype=torch.bool).reshape(-1)
+    selected: dict[str, torch.Tensor] = {}
+    for output_key, input_key in field_map.items():
+        value = forward_inputs.get(input_key)
+        if value is None:
+            continue
+        value_tensor = torch.as_tensor(value).detach().cpu().reshape(-1)
+        if value_tensor.numel() != done_mask.numel():
+            raise ValueError(
+                f"Eval audit field {input_key} has {value_tensor.numel()} rows, "
+                f"expected {done_mask.numel()}"
+            )
+        selected[output_key] = value_tensor[done_mask]
+    return selected
+
+
+def _new_eval_semantic_episode_audit(num_envs: int) -> dict[str, torch.Tensor]:
+    return {
+        "boundary_count": torch.zeros(num_envs, dtype=torch.int64),
+        "bootstrap_clipped_count": torch.zeros(num_envs, dtype=torch.int64),
+        "requested_actual_mismatch_count": torch.zeros(num_envs, dtype=torch.int64),
+        "actual_age_sum": torch.zeros(num_envs, dtype=torch.float64),
+        "actual_age_min": torch.full(
+            (num_envs,), torch.iinfo(torch.int64).max, dtype=torch.int64
+        ),
+        "actual_age_max": torch.full((num_envs,), -1, dtype=torch.int64),
+    }
+
+
+def _reset_eval_semantic_episode_audit(
+    audit: dict[str, torch.Tensor], mask: torch.Tensor | None = None
+) -> None:
+    if mask is None:
+        mask = torch.ones_like(audit["boundary_count"], dtype=torch.bool)
+    else:
+        mask = torch.as_tensor(mask, dtype=torch.bool).reshape(-1).cpu()
+    audit["boundary_count"][mask] = 0
+    audit["bootstrap_clipped_count"][mask] = 0
+    audit["requested_actual_mismatch_count"][mask] = 0
+    audit["actual_age_sum"][mask] = 0.0
+    audit["actual_age_min"][mask] = torch.iinfo(torch.int64).max
+    audit["actual_age_max"][mask] = -1
+
+
+def _accumulate_eval_semantic_episode_audit(
+    audit: dict[str, torch.Tensor],
+    forward_inputs: dict[str, Any] | None,
+    active_mask: torch.Tensor,
+) -> None:
+    if not forward_inputs:
+        return
+    required = {
+        "actual": "rollout_semantic_actual_age_frames",
+        "requested": "rollout_semantic_requested_age_frames",
+        "clipped": "rollout_semantic_bootstrap_clipped",
+    }
+    if any(input_key not in forward_inputs for input_key in required.values()):
+        return
+    num_envs = audit["boundary_count"].numel()
+    values = {
+        key: torch.as_tensor(forward_inputs[input_key]).detach().cpu().reshape(-1)
+        for key, input_key in required.items()
+    }
+    active = torch.as_tensor(active_mask, dtype=torch.bool).detach().cpu().reshape(-1)
+    if active.numel() != num_envs or any(
+        value.numel() != num_envs for value in values.values()
+    ):
+        sizes = {key: value.numel() for key, value in values.items()}
+        raise ValueError(
+            "Eval semantic episode audit row mismatch: "
+            f"expected={num_envs}, active={active.numel()}, fields={sizes}"
+        )
+    actual = values["actual"].to(torch.int64)
+    requested = values["requested"].to(torch.int64)
+    clipped = values["clipped"].to(torch.bool)
+    audit["boundary_count"][active] += 1
+    audit["bootstrap_clipped_count"][active] += clipped[active].to(torch.int64)
+    audit["requested_actual_mismatch_count"][active] += (
+        requested[active] != actual[active]
+    ).to(torch.int64)
+    audit["actual_age_sum"][active] += actual[active].to(torch.float64)
+    audit["actual_age_min"][active] = torch.minimum(
+        audit["actual_age_min"][active], actual[active]
+    )
+    audit["actual_age_max"][active] = torch.maximum(
+        audit["actual_age_max"][active], actual[active]
+    )
+
+
+def _select_eval_semantic_episode_audit(
+    audit: dict[str, torch.Tensor], newly_done: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    done = torch.as_tensor(newly_done, dtype=torch.bool).detach().cpu().reshape(-1)
+    counts = audit["boundary_count"][done]
+    if not counts.numel() or not torch.all(counts > 0):
+        return {}
+    return {
+        "semantic_boundary_count": counts.clone(),
+        "semantic_bootstrap_clipped_boundary_count": audit["bootstrap_clipped_count"][
+            done
+        ].clone(),
+        "semantic_requested_actual_age_mismatch_boundary_count": audit[
+            "requested_actual_mismatch_count"
+        ][done].clone(),
+        "semantic_actual_age_mean": (
+            audit["actual_age_sum"][done] / counts.to(torch.float64)
+        ).to(torch.float32),
+        "semantic_actual_age_min": audit["actual_age_min"][done].clone(),
+        "semantic_actual_age_max": audit["actual_age_max"][done].clone(),
+    }
 
 
 class EnvWorker(Worker):
@@ -213,18 +383,42 @@ class EnvWorker(Worker):
                 self.cfg.env.eval.total_num_envs // self._world_size // self.stage_num
             )
             self.eval_batch_size = self.cfg.env.eval.total_num_envs // self.stage_num
+        configured_train_horizon = self.model_cfg.get("rl_head_config", {}).get(
+            "train_execution_horizon", -1
+        )
+        self.train_execution_horizon = _resolve_train_execution_horizon(
+            self.model_cfg.num_action_chunks, configured_train_horizon
+        )
         self.n_train_chunk_steps = 0
         if self.enable_train:
+            train_control_frames = int(self.cfg.env.train.max_steps_per_rollout_epoch)
+            if train_control_frames % self.train_execution_horizon != 0:
+                raise ValueError(
+                    "env.train.max_steps_per_rollout_epoch must be divisible by "
+                    "train_execution_horizon: "
+                    f"control_frames={train_control_frames}, "
+                    f"execution_horizon={self.train_execution_horizon}"
+                )
             self.n_train_chunk_steps = (
-                self.cfg.env.train.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+                train_control_frames // self.train_execution_horizon
             )
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
-            self.n_eval_chunk_steps = (
-                self.cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+            configured_eval_horizon = self.model_cfg.get("rl_head_config", {}).get(
+                "eval_execution_horizon", -1
             )
+            self.eval_execution_horizon = _resolve_eval_execution_horizon(
+                self.model_cfg.num_action_chunks, configured_eval_horizon
+            )
+            eval_control_frames = int(self.cfg.env.eval.max_steps_per_rollout_epoch)
+            if eval_control_frames % self.eval_execution_horizon != 0:
+                raise ValueError(
+                    "env.eval.max_steps_per_rollout_epoch must be divisible by "
+                    "eval_execution_horizon so all conditions execute the same "
+                    f"control-frame budget: {eval_control_frames=} "
+                    f"eval_execution_horizon={self.eval_execution_horizon}"
+                )
+            self.n_eval_chunk_steps = eval_control_frames // self.eval_execution_horizon
         self.actor_split_num = (
             1 if not self.enable_train else self.get_actor_split_num()
         )
@@ -247,12 +441,43 @@ class EnvWorker(Worker):
                 torch.zeros(self.eval_num_envs_per_stage, dtype=torch.bool)
                 for _ in range(self.stage_num)
             ]
+            self._eval_semantic_episode_audit = [
+                _new_eval_semantic_episode_audit(self.eval_num_envs_per_stage)
+                for _ in range(self.stage_num)
+            ]
             self._prefetch_initial_eval_reset = bool(
                 eval_env_cfg.get("prefetch_initial_reset", False)
             )
             self._prefetched_eval_bootstrap: list[dict[str, Any] | None] = [
                 None for _ in range(self.stage_num)
             ]
+        self._fdvla_information_exporter = None
+        self._fdvla_information_current_obs: list[dict[str, Any] | None] = [
+            None for _ in range(self.stage_num)
+        ]
+        information_export_cfg = (
+            eval_env_cfg.get("information_export", {}) if self.enable_eval else {}
+        )
+        if bool(information_export_cfg.get("enabled", False)):
+            if bool(self.cfg.env.eval.auto_reset):
+                raise ValueError(
+                    "FDVLA information export requires env.eval.auto_reset=false"
+                )
+            output_dir = str(information_export_cfg.get("output_dir", ""))
+            if not output_dir:
+                raise ValueError(
+                    "FDVLA information export requires env.eval.information_export.output_dir"
+                )
+            from rlinf.utils.fdvla_information_export import (
+                FdvlaInformationRawExporter,
+            )
+
+            self._fdvla_information_exporter = FdvlaInformationRawExporter(
+                output_dir,
+                rank=self._rank,
+                stage_count=self.stage_num,
+                num_envs_per_stage=self.eval_num_envs_per_stage,
+            )
         self.env_decoupled_mode = self.cfg.runner.get("enable_decoupled_mode", False)
         self._semantic_env_clock: dict[tuple[str, int], dict[str, torch.Tensor]] = {}
         rl_head_config = self.model_cfg.get("rl_head_config", {})
@@ -279,13 +504,16 @@ class EnvWorker(Worker):
             min_frame=self._semantic_mid_chunk_min_frame,
         )
         _validate_semantic_publish_frame(
-            self._semantic_mid_chunk_publish,
+            self.enable_train and self._semantic_mid_chunk_publish,
             self._semantic_mid_chunk_frame,
-            self.model_cfg.num_action_chunks,
+            self.train_execution_horizon if self.enable_train else 1,
         )
         self._semantic_eval_mid_chunk_frame = _resolve_semantic_eval_publish_frame(
             self._semantic_mid_chunk_frame,
             rl_head_config.get("semantic_eval_mid_chunk_frame", -1),
+        )
+        self._semantic_eval_fixed_age_frames = int(
+            rl_head_config.get("semantic_eval_fixed_age_frames", -1)
         )
         self._semantic_eval_random_age_min_frames = int(
             rl_head_config.get("semantic_eval_random_age_min_frames", -1)
@@ -309,7 +537,24 @@ class EnvWorker(Worker):
         self._semantic_train_target_age = [0 for _ in range(self.stage_num)]
         self._semantic_eval_rollout_step = [0 for _ in range(self.stage_num)]
         self._semantic_eval_target_age = [0 for _ in range(self.stage_num)]
-        if self._semantic_train_random_age_max_frames >= 0:
+        bank_enabled = bool(
+            rl_head_config.get("posthoc_semantic_delay_bank_enabled", False)
+        )
+        # Keep train/eval retention separate: fixed-age evaluation must not
+        # disable latest-only coalescing during natural-asynchronous training.
+        self._semantic_preserve_all_train_publishes = bool(
+            bank_enabled or self._semantic_train_random_age_max_frames >= 0
+        )
+        self._semantic_preserve_all_eval_publishes = bool(
+            self._semantic_eval_fixed_age_frames >= 0
+            or self._semantic_eval_random_age_max_frames >= 0
+        )
+        # Compatibility fallback for callers that do not label their mode.
+        self._semantic_preserve_all_publishes = bool(
+            self._semantic_preserve_all_train_publishes
+            or self._semantic_preserve_all_eval_publishes
+        )
+        if self.enable_train and self._semantic_train_random_age_max_frames >= 0:
             train_semantic_age_frame(
                 0,
                 0,
@@ -319,7 +564,7 @@ class EnvWorker(Worker):
             )
             if (
                 self._semantic_train_random_age_max_frames
-                >= self.model_cfg.num_action_chunks
+                >= self.train_execution_horizon
             ):
                 raise ValueError(
                     "semantic_train_random_age_max_frames must be smaller than the "
@@ -332,18 +577,17 @@ class EnvWorker(Worker):
                 self._semantic_eval_random_age_max_frames,
                 self._semantic_eval_random_age_seed,
             )
-            if (
-                self._semantic_eval_random_age_max_frames
-                >= self.model_cfg.num_action_chunks
-            ):
+            if self._semantic_eval_random_age_max_frames >= self.eval_execution_horizon:
                 raise ValueError(
                     "semantic_eval_random_age_max_frames must be smaller than the "
                     "executed action chunk so its source observation is publishable"
                 )
         _validate_semantic_publish_frame(
-            self._semantic_mid_chunk_publish,
+            self.enable_eval
+            and self._semantic_mid_chunk_publish
+            and self._semantic_eval_fixed_age_frames < 0,
             self._semantic_eval_mid_chunk_frame,
-            self.model_cfg.num_action_chunks,
+            self.eval_execution_horizon if self.enable_eval else 1,
         )
         self._semantic_raw_publisher = None
 
@@ -401,6 +645,8 @@ class EnvWorker(Worker):
             self._semantic_mid_chunk_publish
             or self._semantic_env_bootstrap_publish
             or self._semantic_env_boundary_publish
+            or self._semantic_eval_fixed_age_frames >= 0
+            or self._semantic_eval_random_age_max_frames >= 0
         ):
             from rlinf.models.embodiment.gr00t.gr00t_n1d7.semantic_server import (
                 Gr00tN1d7RawObservationPublisher,
@@ -616,10 +862,27 @@ class EnvWorker(Worker):
             env_list.append(env)
         return env_list
 
+    def _get_eval_semantic_episode_audit(
+        self, stage_id: int
+    ) -> dict[str, torch.Tensor]:
+        """Return the per-stage audit, creating it for legacy/minimal workers."""
+        audits = getattr(self, "_eval_semantic_episode_audit", None)
+        if audits is None:
+            audits = []
+            self._eval_semantic_episode_audit = audits
+        while len(audits) <= stage_id:
+            audits.append(
+                _new_eval_semantic_episode_audit(self.eval_num_envs_per_stage)
+            )
+        return audits[stage_id]
+
     def _reset_eval_bootstrap(self, stage_id: int) -> dict[str, Any]:
         self.eval_env_list[stage_id].is_start = True
         self.eval_prev_done[stage_id] = torch.zeros(
             self.eval_num_envs_per_stage, dtype=torch.bool
+        )
+        _reset_eval_semantic_episode_audit(
+            self._get_eval_semantic_episode_audit(stage_id)
         )
         extracted_obs, infos = self.eval_env_list[stage_id].reset()
         if bool(self.cfg.env.eval.get("repro_diagnostics", False)):
@@ -650,6 +913,9 @@ class EnvWorker(Worker):
         env = self.eval_env_list[stage_id]
         self.eval_prev_done[stage_id] = torch.zeros(
             self.eval_num_envs_per_stage, dtype=torch.bool
+        )
+        _reset_eval_semantic_episode_audit(
+            self._get_eval_semantic_episode_audit(stage_id)
         )
         reset_state_ids = np.asarray(get_env_attr(env, "reset_state_ids")).copy()
         extracted_obs, infos = env.reset(reset_state_ids=reset_state_ids)
@@ -699,6 +965,12 @@ class EnvWorker(Worker):
             wm_env_type=self.cfg.env.train.get("wm_env_type", None),
             env_cfg=self.cfg.env.train,
         )
+        if int(exec_actions.shape[1]) != int(self.train_execution_horizon):
+            raise RuntimeError(
+                "Rollout action prefix does not match train execution horizon: "
+                f"actions={exec_actions.shape[1]} "
+                f"configured={self.train_execution_horizon}"
+            )
         if isinstance(chunk_actions, dict):
             chunk_actions["actions"] = exec_actions
         else:
@@ -782,14 +1054,25 @@ class EnvWorker(Worker):
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
 
+        padded_rewards = _pad_executed_chunk(
+            chunk_rewards, self.model_cfg.num_action_chunks
+        )
+        padded_terminations = _pad_executed_chunk(
+            chunk_terminations, self.model_cfg.num_action_chunks
+        )
+        padded_truncations = _pad_executed_chunk(
+            chunk_truncations, self.model_cfg.num_action_chunks
+        )
+        padded_dones = torch.logical_or(padded_terminations, padded_truncations)
+
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
-            rewards=chunk_rewards,
+            rewards=padded_rewards,
             env_infos=infos if isinstance(infos, dict) else None,
-            dones=chunk_dones,
-            terminations=chunk_terminations,
-            truncations=chunk_truncations,
+            dones=padded_dones,
+            terminations=padded_terminations,
+            truncations=padded_truncations,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
             rlt_switch_flags=rlt_switch_flags,
@@ -804,7 +1087,10 @@ class EnvWorker(Worker):
         return env_output, env_info, chunk_step_payload
 
     def env_evaluate_step(
-        self, raw_actions: torch.Tensor, stage_id: int
+        self,
+        raw_actions: torch.Tensor,
+        stage_id: int,
+        audit_metadata: dict[str, Any] | None = None,
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to evaluate the environment.
@@ -820,27 +1106,40 @@ class EnvWorker(Worker):
             env_cfg=self.cfg.env.eval,
         )
         env_info = {}
+        _accumulate_eval_semantic_episode_audit(
+            self._eval_semantic_episode_audit[stage_id],
+            audit_metadata,
+            ~self.eval_prev_done[stage_id],
+        )
         semantic_eval_publish_frame = (
             self._semantic_eval_publish_frame_for_next_boundary(stage_id)
         )
 
-        obs_list, _, chunk_terminations, chunk_truncations, infos_list = (
-            self.eval_env_list[stage_id].chunk_step(
-                chunk_actions,
-                mid_chunk_callback=(
-                    lambda obs: (
-                        self._publish_mid_chunk_semantic(
-                            obs, stage_id=stage_id, mode="eval"
-                        )
-                        if (
-                            self._semantic_mid_chunk_publish
-                            and self._semantic_raw_publisher is not None
-                        )
-                        else None
+        (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        ) = self.eval_env_list[stage_id].chunk_step(
+            chunk_actions,
+            mid_chunk_callback=(
+                lambda obs: (
+                    self._publish_mid_chunk_semantic(
+                        obs, stage_id=stage_id, mode="eval"
                     )
-                ),
-                mid_chunk_frame=semantic_eval_publish_frame,
-            )
+                    if (
+                        _should_publish_eval_semantic(
+                            self._semantic_mid_chunk_publish,
+                            self._semantic_eval_fixed_age_frames,
+                            self._semantic_eval_random_age_max_frames,
+                        )
+                        and self._semantic_raw_publisher is not None
+                    )
+                    else None
+                )
+            ),
+            mid_chunk_frame=semantic_eval_publish_frame,
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -881,6 +1180,16 @@ class EnvWorker(Worker):
             elif "episode" in infos:
                 for key in infos["episode"]:
                     env_info[key] = infos["episode"][key][newly_done].cpu()
+            env_info.update(_extract_eval_audit_metadata(audit_metadata, newly_done))
+            env_info.update(
+                _select_eval_semantic_episode_audit(
+                    self._eval_semantic_episode_audit[stage_id], newly_done
+                )
+            )
+            if self.cfg.env.eval.auto_reset:
+                _reset_eval_semantic_episode_audit(
+                    self._eval_semantic_episode_audit[stage_id], newly_done
+                )
 
         rlt_switch_flags = (
             infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
@@ -889,6 +1198,10 @@ class EnvWorker(Worker):
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,
+            rewards=chunk_rewards,
+            dones=chunk_dones,
+            terminations=chunk_terminations,
+            truncations=chunk_truncations,
             env_infos=infos if isinstance(infos, dict) else None,
             rlt_switch_flags=rlt_switch_flags,
         )
@@ -1017,19 +1330,26 @@ class EnvWorker(Worker):
             return adjusted_rewards
 
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
+        final_executed_index = (
+            int(getattr(self, "train_execution_horizon", rewards.shape[1])) - 1
+        )
         if bootstrap_type == "standard":
-            last_step_truncations = env_output.truncations[:, -1]
+            last_step_truncations = env_output.truncations[:, final_executed_index]
         else:
-            last_step_truncations = env_output.dones[:, -1]
+            last_step_truncations = env_output.dones[:, final_executed_index]
 
         if not last_step_truncations.any():
             return adjusted_rewards
 
-        final_values = torch.zeros_like(adjusted_rewards[:, -1], dtype=torch.float32)
+        final_values = torch.zeros_like(
+            adjusted_rewards[:, final_executed_index], dtype=torch.float32
+        )
         final_values[last_step_truncations] = (
             bootstrap_values[last_step_truncations].reshape(-1).to(torch.float32)
         )
-        adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
+        adjusted_rewards[:, final_executed_index] += (
+            self.cfg.algorithm.gamma * final_values
+        )
         return adjusted_rewards
 
     def finish_rollout(self, mode="train"):
@@ -1434,10 +1754,11 @@ class EnvWorker(Worker):
             obs, stage_id=stage_id, mode=mode, update_clock=True
         )
         if (
-            self._semantic_env_bootstrap_publish
-            and self._semantic_raw_publisher is not None
+            getattr(self, "_semantic_env_bootstrap_publish", False)
+            and getattr(self, "_semantic_raw_publisher", None) is not None
             and bool(metadata["frame_ids"].eq(0).any())
         ):
+            metadata["semantic_mode"] = mode
             self._publish_semantic_observation(obs, metadata)
         obs["__rlinf_semantic_env_ids"] = metadata["env_ids"]
         obs["__rlinf_semantic_frame_ids"] = metadata["frame_ids"]
@@ -1446,10 +1767,17 @@ class EnvWorker(Worker):
             "observation_wallclock_s"
         ]
         target_age = None
-        if mode == "train" and self._semantic_train_random_age_max_frames >= 0:
+        if (
+            mode == "train"
+            and getattr(self, "_semantic_train_random_age_max_frames", -1) >= 0
+        ):
             target_age = self._semantic_train_target_age[stage_id]
-        elif mode == "eval" and self._semantic_eval_random_age_max_frames >= 0:
-            target_age = self._semantic_eval_target_age[stage_id]
+        elif mode == "eval":
+            fixed_age = getattr(self, "_semantic_eval_fixed_age_frames", -1)
+            if fixed_age >= 0:
+                target_age = fixed_age
+            elif getattr(self, "_semantic_eval_random_age_max_frames", -1) >= 0:
+                target_age = self._semantic_eval_target_age[stage_id]
         if target_age is not None:
             obs["__rlinf_semantic_target_age_frames"] = torch.full(
                 (metadata["frame_ids"].numel(),),
@@ -1493,14 +1821,18 @@ class EnvWorker(Worker):
         else:
             frame_ids = torch.as_tensor(elapsed).reshape(-1).to(dtype=torch.int64).cpu()
         clock_key = (mode, stage_id)
-        clock = self._semantic_env_clock.get(clock_key)
+        semantic_env_clock = getattr(self, "_semantic_env_clock", None)
+        if semantic_env_clock is None:
+            semantic_env_clock = {}
+            self._semantic_env_clock = semantic_env_clock
+        clock = semantic_env_clock.get(clock_key)
         if clock is None or clock["frame_ids"].numel() != batch_size:
             generations = torch.zeros(batch_size, dtype=torch.int64)
         else:
             generations = clock["generations"].clone()
             generations[frame_ids < clock["frame_ids"]] += 1
         if update_clock:
-            self._semantic_env_clock[clock_key] = {
+            semantic_env_clock[clock_key] = {
                 "frame_ids": frame_ids.clone(),
                 "generations": generations.clone(),
             }
@@ -1530,9 +1862,29 @@ class EnvWorker(Worker):
             "episode_generations": metadata["episode_generations"].tolist(),
             "observation_wallclock_s": metadata["observation_wallclock_s"].tolist(),
         }
+        semantic_mode = metadata.get("semantic_mode")
+        if semantic_mode == "train":
+            preserve_all = getattr(
+                self,
+                "_semantic_preserve_all_train_publishes",
+                getattr(self, "_semantic_preserve_all_publishes", False),
+            )
+        elif semantic_mode == "eval":
+            preserve_all = getattr(
+                self,
+                "_semantic_preserve_all_eval_publishes",
+                getattr(self, "_semantic_preserve_all_publishes", False),
+            )
+        else:
+            preserve_all = getattr(self, "_semantic_preserve_all_publishes", False)
+        if preserve_all:
+            publish_metadata["semantic_preserve_all"] = True
         if "semantic_priority" in metadata:
             publish_metadata["semantic_priority"] = int(metadata["semantic_priority"])
-        publisher.publish(raw_observation, publish_metadata)
+        if preserve_all:
+            publisher.publish(raw_observation, publish_metadata, preserve_all=True)
+        else:
+            publisher.publish(raw_observation, publish_metadata)
 
     def _publish_mid_chunk_semantic(
         self, obs: dict[str, Any], *, stage_id: int, mode: str
@@ -1540,6 +1892,7 @@ class EnvWorker(Worker):
         metadata = self._build_semantic_metadata(
             obs, stage_id=stage_id, mode=mode, update_clock=False
         )
+        metadata["semantic_mode"] = mode
         metadata["semantic_priority"] = 1
         self._publish_semantic_observation(obs, metadata)
 
@@ -1549,11 +1902,24 @@ class EnvWorker(Worker):
         metadata = self._build_semantic_metadata(
             obs, stage_id=stage_id, mode=mode, update_clock=False
         )
+        metadata["semantic_mode"] = mode
         metadata["semantic_priority"] = 1
         self._publish_semantic_observation(obs, metadata)
 
     def _semantic_eval_publish_frame_for_next_boundary(self, stage_id: int) -> int:
         random_max = self._semantic_eval_random_age_max_frames
+        fixed_age = getattr(self, "_semantic_eval_fixed_age_frames", -1)
+        execution_horizon = int(
+            getattr(
+                self,
+                "eval_execution_horizon",
+                self.model_cfg.num_action_chunks,
+            )
+        )
+        if fixed_age >= 0:
+            self._semantic_eval_rollout_step[stage_id] += 1
+            self._semantic_eval_target_age[stage_id] = fixed_age
+            return _fixed_age_publish_frame(fixed_age, execution_horizon)
         if random_max < 0:
             return self._semantic_eval_mid_chunk_frame
         rollout_step = self._semantic_eval_rollout_step[stage_id]
@@ -1567,7 +1933,7 @@ class EnvWorker(Worker):
         )
         self._semantic_eval_rollout_step[stage_id] += 1
         self._semantic_eval_target_age[stage_id] = age
-        return int(self.model_cfg.num_action_chunks) - age
+        return execution_horizon - age
 
     def _reset_semantic_eval_schedule(self) -> None:
         """Restart deterministic semantic-age streams for every validation call."""
@@ -1589,7 +1955,7 @@ class EnvWorker(Worker):
         )
         self._semantic_train_rollout_step[stage_id] += 1
         self._semantic_train_target_age[stage_id] = age
-        return int(self.model_cfg.num_action_chunks) - age
+        return int(self.train_execution_horizon) - age
 
     def _send_train_bootstrap(
         self, rollout_channel: Channel, env_outputs: list[EnvOutput]
@@ -1687,6 +2053,7 @@ class EnvWorker(Worker):
         )
         env_metrics = defaultdict(list)
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
+        use_shared_semantic_reward = getattr(self, "use_shared_semantic_reward", False)
 
         for epoch in range(self.rollout_epoch):
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
@@ -1709,7 +2076,7 @@ class EnvWorker(Worker):
                         )
 
                     rollout_result = None
-                    if self.use_shared_semantic_reward:
+                    if use_shared_semantic_reward:
                         rollout_result = self.recv_from(
                             group_name=self.cfg.rollout.group_name,
                             channel=input_channel,
@@ -1725,7 +2092,7 @@ class EnvWorker(Worker):
 
                     reward_model_output = None
                     if reward_channel is not None and (
-                        chunk_step_idx != 0 or self.use_shared_semantic_reward
+                        chunk_step_idx != 0 or use_shared_semantic_reward
                     ):
                         reward_model_output = self.get_reward_model_output(
                             env_output,
@@ -1759,11 +2126,7 @@ class EnvWorker(Worker):
                     rewards = self.compute_bootstrap_rewards(
                         env_output,
                         rollout_result.bootstrap_values,
-                        (
-                            None
-                            if self.use_shared_semantic_reward
-                            else reward_model_output
-                        ),
+                        (None if use_shared_semantic_reward else reward_model_output),
                     )
                     chunk_step_result = ChunkStepResult(
                         actions=rollout_result.forward_inputs.get("action", None),
@@ -1786,10 +2149,7 @@ class EnvWorker(Worker):
                     )
 
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                    if (
-                        self.use_shared_semantic_reward
-                        and reward_model_output is not None
-                    ):
+                    if use_shared_semantic_reward and reward_model_output is not None:
                         self.assign_semantic_interval_reward(
                             stage_id,
                             reward_model_output,
@@ -1865,7 +2225,7 @@ class EnvWorker(Worker):
                     )
 
                 rollout_result = None
-                if self.use_shared_semantic_reward:
+                if use_shared_semantic_reward:
                     rollout_result = self.recv_from(
                         group_name=self.cfg.rollout.group_name,
                         channel=input_channel,
@@ -1910,7 +2270,7 @@ class EnvWorker(Worker):
                 rewards = self.compute_bootstrap_rewards(
                     env_output,
                     rollout_result.bootstrap_values,
-                    None if self.use_shared_semantic_reward else reward_model_output,
+                    None if use_shared_semantic_reward else reward_model_output,
                 )
                 final_actions = rollout_result.forward_inputs.get("action", None)
                 final_forward_inputs = rollout_result.forward_inputs
@@ -1939,7 +2299,7 @@ class EnvWorker(Worker):
                     rewards=rewards,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
-                if self.use_shared_semantic_reward and reward_model_output is not None:
+                if use_shared_semantic_reward and reward_model_output is not None:
                     self.assign_semantic_interval_reward(
                         stage_id,
                         reward_model_output,
@@ -2020,6 +2380,12 @@ class EnvWorker(Worker):
                         bootstrap = self._take_eval_bootstrap(stage_id)
                     else:
                         bootstrap = self._continue_eval_bootstrap(stage_id)
+                    information_exporter = getattr(
+                        self, "_fdvla_information_exporter", None
+                    )
+                    if information_exporter is not None:
+                        information_exporter.reset_stage(stage_id)
+                        self._fdvla_information_current_obs[stage_id] = bootstrap["obs"]
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
@@ -2038,9 +2404,7 @@ class EnvWorker(Worker):
                         tag="eval_rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         batch_size=self.eval_batch_size,
-                        infer_batch_size_fn=self._infer_rollout_batch_size
-                        if self.env_decoupled_mode
-                        else None,
+                        infer_batch_size_fn=self._infer_rollout_batch_size,
                         decoupled_mode=self.env_decoupled_mode,
                     )
                     raw_chunk_actions = (
@@ -2052,9 +2416,31 @@ class EnvWorker(Worker):
                         raw_chunk_actions = raw_chunk_actions.detach().cpu().numpy()
                     else:
                         raw_chunk_actions = np.asarray(raw_chunk_actions)
-                    env_output, env_info = self.env_evaluate_step(
-                        raw_chunk_actions, stage_id
+                    audit_metadata = (
+                        rollout_results.forward_inputs
+                        if hasattr(rollout_results, "forward_inputs")
+                        else None
                     )
+                    if information_exporter is not None:
+                        current_obs = self._fdvla_information_current_obs[stage_id]
+                        if current_obs is None or audit_metadata is None:
+                            raise RuntimeError(
+                                "FDVLA information export lost eval observation "
+                                "or rollout forward_inputs"
+                            )
+                        information_exporter.record_boundary(
+                            stage_id, current_obs, audit_metadata
+                        )
+                    env_output, env_info = self.env_evaluate_step(
+                        raw_chunk_actions, stage_id, audit_metadata
+                    )
+                    if information_exporter is not None:
+                        information_exporter.finish_step(
+                            stage_id,
+                            terminations=env_output.terminations,
+                            truncations=env_output.truncations,
+                        )
+                        self._fdvla_information_current_obs[stage_id] = env_output.obs
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
@@ -2081,6 +2467,10 @@ class EnvWorker(Worker):
                         decoupled_mode=self.env_decoupled_mode,
                     )
 
+            information_exporter = getattr(self, "_fdvla_information_exporter", None)
+            if information_exporter is not None:
+                for stage_id in range(self.stage_num):
+                    information_exporter.assert_stage_complete(stage_id)
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):
             if self.eval_enable_offload:

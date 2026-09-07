@@ -34,6 +34,34 @@ def test_critic_metrics_are_finite_for_constant_returns():
     assert torch.isfinite(metrics["critic/explained_variance"])
 
 
+def test_critic_warmup_can_disable_stale_value_clipping():
+    clipped_values = torch.tensor([[0.5]], requires_grad=True)
+    clipped_loss, clipped_metrics = compute_ppo_critic_loss(
+        values=clipped_values,
+        returns=torch.zeros(1, 1),
+        prev_values=torch.full((1, 1), 2.0),
+        value_clip=0.2,
+        huber_delta=10.0,
+    )
+    clipped_loss.backward()
+
+    warmup_values = torch.tensor([[0.5]], requires_grad=True)
+    warmup_loss, warmup_metrics = compute_ppo_critic_loss(
+        values=warmup_values,
+        returns=torch.zeros(1, 1),
+        prev_values=torch.full((1, 1), 2.0),
+        value_clip=None,
+        huber_delta=10.0,
+    )
+    warmup_loss.backward()
+
+    assert clipped_loss > warmup_loss
+    assert clipped_metrics["critic/value_clip_ratio"] == 1
+    assert warmup_metrics["critic/value_clip_ratio"] == 0
+    assert clipped_values.grad.item() == 0.0
+    assert warmup_values.grad.item() != 0.0
+
+
 def test_actor_rejects_impossible_logprob_shape():
     try:
         compute_ppo_actor_loss(

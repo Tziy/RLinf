@@ -20,6 +20,25 @@ from omegaconf import DictConfig, OmegaConf
 from rlinf.utils.logging import get_logger
 
 
+def _initialize_value_head_with_seed(value_head: torch.nn.Module, seed: int) -> None:
+    """Initialize a replicated critic identically without advancing caller RNG."""
+    cuda_devices = sorted(
+        {
+            parameter.device.index
+            for parameter in value_head.parameters()
+            if parameter.is_cuda and parameter.device.index is not None
+        }
+    )
+    with torch.random.fork_rng(devices=cuda_devices):
+        # Seed only generators used by this module. ``torch.manual_seed`` also
+        # mutates unrelated CUDA generators visible to the process.
+        torch.random.default_generator.manual_seed(int(seed))
+        for device in cuda_devices:
+            with torch.cuda.device(device):
+                torch.cuda.manual_seed(int(seed))
+        value_head._init_weights()
+
+
 def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
     from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
@@ -95,9 +114,17 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
 
     model.to(torch_dtype)
     if cfg.rl_head_config.add_value_head and hasattr(model.action_head, "value_head"):
-        model.action_head.value_head._init_weights()
+        value_head_init_seed = int(cfg.rl_head_config.get("value_head_init_seed", 0))
+        _initialize_value_head_with_seed(
+            model.action_head.value_head, value_head_init_seed
+        )
+        logger.info("Value head deterministic init seed: %d", value_head_init_seed)
 
     if cfg.rl_head_config.disable_dropout:
         replace_dropout_with_identity(model)
+
+    model.emit_fdvla_parameter_audit(
+        require_frozen_vlm=bool(cfg.rl_head_config.get("require_frozen_vlm", False))
+    )
 
     return model

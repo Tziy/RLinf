@@ -291,6 +291,7 @@ def preprocess_loss_inputs(
     returns: Optional[torch.Tensor] = None,
     reward_type: Optional[str] = None,
     versions: Optional[torch.Tensor] = None,
+    action_execution_horizon: Optional[int] = None,
     **kwargs,
 ) -> dict:
     if reward_type == "chunk_level":
@@ -341,12 +342,25 @@ def preprocess_loss_inputs(
 
     elif logprob_type == "chunk_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz]
-        logprobs = logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
-        old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
+        logprobs = logprobs.reshape(bsz, -1, single_action_dim)
+        old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim)
+        predicted_horizon = logprobs.shape[1]
+        execution_horizon = (
+            predicted_horizon
+            if action_execution_horizon is None or action_execution_horizon < 0
+            else action_execution_horizon
+        )
+        if not 1 <= execution_horizon <= predicted_horizon:
+            raise ValueError(
+                "action_execution_horizon must be within the predicted action "
+                f"horizon: execution={execution_horizon}, predicted={predicted_horizon}"
+            )
+        logprobs = logprobs[:, :execution_horizon].sum(dim=[1, 2])
+        old_logprobs = old_logprobs[:, :execution_horizon].sum(dim=[1, 2])
         if proximal_logprobs is not None:
             proximal_logprobs = proximal_logprobs.reshape(
                 bsz, -1, single_action_dim
-            ).sum(dim=[1, 2])
+            )[:, :execution_horizon].sum(dim=[1, 2])
         if versions is not None:
             versions = versions.reshape(bsz, -1, single_action_dim)[:, 0, 0]
 

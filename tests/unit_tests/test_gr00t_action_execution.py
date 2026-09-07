@@ -2,10 +2,12 @@
 import pytest
 import torch
 
+from rlinf.algorithms.utils import preprocess_loss_inputs
 from rlinf.models.embodiment.gr00t.gr00t_n1d7.gr00t_action_model import (
     GR00T_N1_7_ForRLActionPrediction,
     _execution_action_prefix,
 )
+from rlinf.workers.env.env_worker import _pad_executed_chunk
 
 
 def test_execution_prefix_keeps_model_horizon_separate_from_env_horizon():
@@ -54,3 +56,32 @@ def test_semantic_action_only_transform_requires_matching_cache_identity(
 def test_execution_prefix_rejects_invalid_horizon(execution_horizon):
     with pytest.raises(ValueError, match="execution_horizon"):
         _execution_action_prefix(torch.zeros(2, 16, 7), execution_horizon)
+
+
+def test_executed_chunk_padding_preserves_prefix_and_zeros_suffix():
+    executed = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    padded = _pad_executed_chunk(executed, predicted_horizon=16)
+
+    assert padded.shape == (2, 16)
+    torch.testing.assert_close(padded[:, :2], executed)
+    assert torch.count_nonzero(padded[:, 2:]) == 0
+
+
+def test_chunk_logprob_sums_only_executed_action_prefix():
+    current = torch.ones(1, 4, 2)
+    current[:, 2:] = 100.0
+    old = torch.zeros_like(current)
+
+    inputs = preprocess_loss_inputs(
+        logprobs=current,
+        old_logprobs=old,
+        advantages=torch.ones(1),
+        logprob_type="chunk_level",
+        single_action_dim=2,
+        reward_type="chunk_level",
+        action_execution_horizon=2,
+    )
+
+    torch.testing.assert_close(inputs["logprobs"], torch.tensor([4.0]))
+    torch.testing.assert_close(inputs["old_logprobs"], torch.tensor([0.0]))

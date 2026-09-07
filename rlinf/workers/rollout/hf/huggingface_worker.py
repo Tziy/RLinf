@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import time
+from collections import defaultdict
 from typing import Any, Callable, Literal, Optional
 
 import numpy as np
@@ -40,7 +41,25 @@ from rlinf.utils.checkpoint import (
     gr00t_delay_adapter_missing_prefixes,
     load_state_dict_with_allowed_missing,
 )
+from rlinf.utils.fdvla_realtime import (
+    resolve_eval_execution_horizon,
+    resolve_train_execution_horizon,
+)
+from rlinf.utils.nested_dict_process import split_dict
 from rlinf.utils.placement import HybridComponentPlacement
+
+
+def _fdvla_sample_summary(values: list[float]) -> dict[str, float]:
+    """Summarize one rollout-worker profiling stream in its native units."""
+    array = np.asarray(values, dtype=np.float64)
+    if not len(array):
+        return {}
+    return {
+        "mean": float(array.mean()),
+        "p50": float(np.percentile(array, 50)),
+        "p95": float(np.percentile(array, 95)),
+        "count": float(len(array)),
+    }
 
 
 class MultiStepRolloutWorker(Worker):
@@ -104,20 +123,48 @@ class MultiStepRolloutWorker(Worker):
             self.eval_batch_size // self._world_size if self.enable_eval else 0
         )
 
+        self.inference_micro_batch_size = int(
+            self.cfg.rollout.get("inference_micro_batch_size", 0)
+        )
+        if self.inference_micro_batch_size < 0:
+            raise ValueError("rollout.inference_micro_batch_size must be non-negative")
+
         self.enable_cuda_graph = cfg.rollout.get("enable_cuda_graph", False)
 
-        self.n_train_chunk_steps = (
-            cfg.env.train.max_steps_per_rollout_epoch
-            // self.model_cfg.num_action_chunks
-            if self.enable_train
-            else 0
-        )
+        self.n_train_chunk_steps = 0
+        if self.enable_train:
+            train_execution_horizon = resolve_train_execution_horizon(
+                self.model_cfg.num_action_chunks,
+                self.model_cfg.get("rl_head_config", {}).get(
+                    "train_execution_horizon", -1
+                ),
+            )
+            train_control_frames = int(cfg.env.train.max_steps_per_rollout_epoch)
+            if train_control_frames % train_execution_horizon:
+                raise ValueError(
+                    "train max_steps_per_rollout_epoch must be divisible by "
+                    "train_execution_horizon: "
+                    f"control_frames={train_control_frames}, "
+                    f"execution_horizon={train_execution_horizon}"
+                )
+            self.n_train_chunk_steps = train_control_frames // train_execution_horizon
         self.n_eval_chunk_steps = 0
         if self.enable_eval:
-            self.n_eval_chunk_steps = (
-                cfg.env.eval.max_steps_per_rollout_epoch
-                // self.model_cfg.num_action_chunks
+            eval_execution_horizon = resolve_eval_execution_horizon(
+                self.model_cfg.num_action_chunks,
+                self.model_cfg.get("rl_head_config", {}).get(
+                    "eval_execution_horizon", -1
+                ),
             )
+            eval_control_frames = int(cfg.env.eval.max_steps_per_rollout_epoch)
+            if eval_control_frames % eval_execution_horizon:
+                raise ValueError(
+                    "eval max_steps_per_rollout_epoch must be divisible by "
+                    "eval_execution_horizon: "
+                    f"control_frames={eval_control_frames}, "
+                    f"execution_horizon={eval_execution_horizon}"
+                )
+            self.n_eval_chunk_steps = eval_control_frames // eval_execution_horizon
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
         self.finished_episodes = None
@@ -141,6 +188,223 @@ class MultiStepRolloutWorker(Worker):
                 "rollout_results": [],
             }
         self.rollout_queue_size = self.cfg.rollout.get("rollout_queue_size", 0)
+        self._fdvla_profile_samples: dict[str, list[float]] = defaultdict(list)
+        self._fdvla_action_boundaries = 0
+        self._fdvla_control_frames = 0
+        self._fdvla_local_vlm_forward_count = 0
+        self._fdvla_semantic_packet_consumptions = 0
+        self._fdvla_semantic_unique_packets: set[tuple[int, ...]] = set()
+        self._fdvla_semantic_consecutive_reuses = 0
+        self._fdvla_semantic_identity_incomplete_count = 0
+        self._fdvla_last_semantic_packet_by_env: dict[
+            tuple[int, int], tuple[int, ...]
+        ] = {}
+
+    def pop_execution_times(self) -> dict[str, float]:
+        """Return native timers plus windowed FDVLA latency distributions."""
+        metrics = super().pop_execution_times()
+        for name, values in self._fdvla_profile_samples.items():
+            for statistic, value in _fdvla_sample_summary(values).items():
+                metrics[f"profile/{name}_{statistic}"] = value
+        metrics["profile/action_boundary_count"] = float(self._fdvla_action_boundaries)
+        metrics["profile/control_frame_count"] = float(self._fdvla_control_frames)
+        metrics["profile/local_vlm_forward_count"] = float(
+            self._fdvla_local_vlm_forward_count
+        )
+        packet_consumptions = int(
+            getattr(self, "_fdvla_semantic_packet_consumptions", 0)
+        )
+        unique_packets = len(getattr(self, "_fdvla_semantic_unique_packets", set()))
+        consecutive_reuses = int(getattr(self, "_fdvla_semantic_consecutive_reuses", 0))
+        metrics["profile/semantic_packet_consumption_count"] = float(
+            packet_consumptions
+        )
+        metrics["profile/semantic_unique_packet_count"] = float(unique_packets)
+        metrics["profile/semantic_consecutive_reuse_count"] = float(consecutive_reuses)
+        metrics["profile/dit_forwards_per_unique_semantic_packet"] = float(
+            packet_consumptions / unique_packets if unique_packets else 0.0
+        )
+        metrics["profile/semantic_consecutive_reuse_fraction"] = float(
+            consecutive_reuses / packet_consumptions if packet_consumptions else 0.0
+        )
+        metrics["profile/semantic_identity_incomplete_count"] = float(
+            getattr(self, "_fdvla_semantic_identity_incomplete_count", 0)
+        )
+        metrics["profile/cross_episode_packet_mismatch_count"] = float(
+            getattr(
+                getattr(self, "hf_model", None),
+                "_semantic_cross_episode_packet_mismatch_count",
+                0,
+            )
+        )
+        metrics["profile/semantic_latest_fetch_skipped_count"] = float(
+            getattr(
+                getattr(self, "hf_model", None),
+                "_semantic_latest_fetch_skipped_count",
+                0,
+            )
+        )
+        if torch.cuda.is_available():
+            metrics["profile/peak_gpu_memory_mib"] = float(
+                torch.cuda.max_memory_allocated(self.device) / (1024**2)
+            )
+            torch.cuda.reset_peak_memory_stats(self.device)
+        self._fdvla_profile_samples.clear()
+        self._fdvla_action_boundaries = 0
+        self._fdvla_control_frames = 0
+        self._fdvla_local_vlm_forward_count = 0
+        self._fdvla_semantic_packet_consumptions = 0
+        self._fdvla_semantic_unique_packets = set()
+        self._fdvla_semantic_consecutive_reuses = 0
+        self._fdvla_semantic_identity_incomplete_count = 0
+        self._fdvla_last_semantic_packet_by_env = {}
+        return metrics
+
+    def _record_fdvla_semantic_reuse(self, forward_inputs: dict[str, Any]) -> None:
+        """Count policy-side reuse of the exact rollout semantic packet."""
+        identity_fields = (
+            "rollout_semantic_env_ids",
+            "rollout_semantic_episode_generations",
+            "rollout_semantic_source_frame_ids",
+            "rollout_semantic_versions",
+        )
+        missing_fields = [
+            name for name in identity_fields if forward_inputs.get(name) is None
+        ]
+        if missing_fields:
+            if not getattr(self, "_fdvla_semantic_identity_warning_emitted", False):
+                worker_logger = getattr(self, "_logger", None)
+                if worker_logger is not None:
+                    worker_logger.warning(
+                        "FDVLA semantic reuse identity unavailable: missing=%s available=%s",
+                        missing_fields,
+                        sorted(forward_inputs),
+                    )
+                self._fdvla_semantic_identity_warning_emitted = True
+            self._fdvla_semantic_identity_incomplete_count = (
+                int(getattr(self, "_fdvla_semantic_identity_incomplete_count", 0)) + 1
+            )
+            return
+        rows = [
+            torch.as_tensor(forward_inputs[name]).detach().cpu().reshape(-1).tolist()
+            for name in identity_fields
+        ]
+        row_count = len(rows[0])
+        if any(len(values) != row_count for values in rows[1:]):
+            self._fdvla_semantic_identity_incomplete_count = (
+                int(getattr(self, "_fdvla_semantic_identity_incomplete_count", 0)) + 1
+            )
+            return
+        fingerprint = forward_inputs.get("rollout_semantic_fingerprint")
+        fingerprint_values = None
+        if fingerprint is not None:
+            fingerprint_rows = torch.as_tensor(fingerprint).detach().cpu()
+            if (
+                fingerprint_rows.ndim == 0
+                or fingerprint_rows.shape[0] != row_count
+                or fingerprint_rows.numel() == 0
+                or not torch.isfinite(fingerprint_rows).all()
+            ):
+                self._fdvla_semantic_identity_incomplete_count = (
+                    int(getattr(self, "_fdvla_semantic_identity_incomplete_count", 0))
+                    + 1
+                )
+                return
+            # Replay auditing stores a vector of float samples for each env.
+            # Preserve the batch axis and fractional values in packet identity.
+            fingerprint_values = fingerprint_rows.reshape(row_count, -1).tolist()
+        unique_packets = getattr(self, "_fdvla_semantic_unique_packets", None)
+        if unique_packets is None:
+            unique_packets = set()
+            self._fdvla_semantic_unique_packets = unique_packets
+        last_by_env = getattr(self, "_fdvla_last_semantic_packet_by_env", None)
+        if last_by_env is None:
+            last_by_env = {}
+            self._fdvla_last_semantic_packet_by_env = last_by_env
+        for row_index, (env_id, generation, source_frame, version) in enumerate(
+            zip(*rows, strict=True)
+        ):
+            identity = (
+                int(env_id),
+                int(generation),
+                int(source_frame),
+                int(version),
+            )
+            if fingerprint_values is not None:
+                identity = (*identity, tuple(fingerprint_values[row_index]))
+            stream = (int(env_id), int(generation))
+            if last_by_env.get(stream) == identity:
+                self._fdvla_semantic_consecutive_reuses = (
+                    int(getattr(self, "_fdvla_semantic_consecutive_reuses", 0)) + 1
+                )
+            last_by_env[stream] = identity
+            unique_packets.add(identity)
+            self._fdvla_semantic_packet_consumptions = (
+                int(getattr(self, "_fdvla_semantic_packet_consumptions", 0)) + 1
+            )
+
+    def _record_fdvla_profile(
+        self,
+        *,
+        actions: torch.Tensor | np.ndarray,
+        result: dict[str, Any],
+        prediction_s: float,
+        semantic_fetch_s: float,
+    ) -> None:
+        """Record observational timing only; never feed it into policy state."""
+        if not hasattr(self.hf_model, "_last_semantic_fetch_s"):
+            return
+        total_ms = max(0.0, float(prediction_s) * 1000.0)
+        semantic_ms = max(0.0, float(semantic_fetch_s) * 1000.0)
+        self._fdvla_profile_samples["action_generation_total_ms"].append(total_ms)
+        self._fdvla_profile_samples["semantic_fetch_ms"].append(semantic_ms)
+        self._fdvla_profile_samples["dit_generation_excluding_semantic_ms"].append(
+            max(0.0, total_ms - semantic_ms)
+        )
+
+        head_cfg = self.model_cfg.get("rl_head_config", {})
+        # This is the complete action-critical semantic path, including exact-age
+        # waits, payload transfer and local coupled VLM compute. A server's
+        # narrower foreground-wait metric omits exact fetches and is not suitable
+        # as the action-boundary blocking definition.
+        blocking_ms = semantic_ms
+        self._fdvla_profile_samples["action_boundary_blocking_ms"].append(
+            max(0.0, blocking_ms)
+        )
+
+        forward_inputs = result.get("forward_inputs", {})
+        self._record_fdvla_semantic_reuse(forward_inputs)
+        source = forward_inputs.get("rollout_semantic_source_wallclock_s")
+        completed = forward_inputs.get("rollout_semantic_completed_wallclock_s")
+        if source is not None and completed is not None:
+            queue_ms = (
+                (torch.as_tensor(completed) - torch.as_tensor(source))
+                .clamp_min(0)
+                .double()
+                .reshape(-1)
+                .mul(1000.0)
+                .cpu()
+                .tolist()
+            )
+            self._fdvla_profile_samples["semantic_queue_latency_ms"].extend(queue_ms)
+
+        actual_age = forward_inputs.get("rollout_semantic_actual_age_frames")
+        if actual_age is None and forward_inputs.get("packet_age_s") is not None:
+            actual_age = torch.as_tensor(forward_inputs["packet_age_s"]) * float(
+                head_cfg.get("semantic_control_hz", 20.0)
+            )
+        if actual_age is not None:
+            self._fdvla_profile_samples["semantic_age_frames"].extend(
+                torch.as_tensor(actual_age).float().reshape(-1).cpu().tolist()
+            )
+
+        action_shape = tuple(actions.shape)
+        batch_size = int(action_shape[0]) if action_shape else 0
+        chunk_size = int(action_shape[1]) if len(action_shape) >= 2 else 1
+        self._fdvla_action_boundaries += 1
+        self._fdvla_control_frames += batch_size * chunk_size
+        if str(head_cfg.get("execution_mode", "coupled")) == "coupled":
+            self._fdvla_local_vlm_forward_count += 1
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.model_cfg)
@@ -543,6 +807,12 @@ class MultiStepRolloutWorker(Worker):
                 kwargs = {"mode": "eval"}
             else:
                 kwargs = {"mode": mode}
+            if mode == "eval" and bool(
+                self.model_cfg.get("rl_head_config", {}).get(
+                    "eval_audit_metadata", False
+                )
+            ):
+                kwargs["return_semantic_features"] = True
 
         if SupportedModel(self.model_cfg.model_type) in [
             SupportedModel.CNN_POLICY,
@@ -571,10 +841,12 @@ class MultiStepRolloutWorker(Worker):
                 )
                 expert_label_flag = True
             else:
+                prediction_started = time.perf_counter()
                 actions, result = self.hf_model.predict_action_batch(
                     env_obs=env_obs,
                     **kwargs,
                 )
+                prediction_s = time.perf_counter() - prediction_started
                 semantic_fetch_s = getattr(
                     self.hf_model, "_last_semantic_fetch_s", None
                 )
@@ -583,6 +855,12 @@ class MultiStepRolloutWorker(Worker):
                     self._timer_metrics[tag] = self._timer_metrics.get(
                         tag, 0.0
                     ) + float(semantic_fetch_s)
+                    self._record_fdvla_profile(
+                        actions=actions,
+                        result=result,
+                        prediction_s=prediction_s,
+                        semantic_fetch_s=float(semantic_fetch_s),
+                    )
 
             # Decide re-label or not
             if (
@@ -610,6 +888,63 @@ class MultiStepRolloutWorker(Worker):
         result["expert_label_flag"] = bool(expert_label_flag)
         return actions, result
 
+    def _predict_microbatched(
+        self,
+        env_obs: dict[str, Any],
+        mode: Literal["train", "eval"],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Run one policy replica on ordered row microbatches and merge on CPU."""
+        batch_size = self._infer_env_batch_size(env_obs)
+        micro_batch_size = self.inference_micro_batch_size
+        if micro_batch_size <= 0 or batch_size <= micro_batch_size:
+            return self.predict(env_obs, mode=mode)
+        if self.enable_dagger:
+            raise RuntimeError(
+                "rollout inference microbatching is not supported with DAgger"
+            )
+
+        split_sizes = [micro_batch_size] * (batch_size // micro_batch_size)
+        remainder = batch_size % micro_batch_size
+        if remainder:
+            split_sizes.append(remainder)
+
+        allowed_result_keys = {
+            "prev_logprobs",
+            "prev_values",
+            "forward_inputs",
+            "intervene_flags",
+            "expert_label_flag",
+        }
+        rollout_results = []
+        expert_label_flags = []
+        for obs_shard in split_dict(env_obs, split_sizes):
+            actions, result = self.predict(obs_shard, mode=mode)
+            unexpected_keys = set(result) - allowed_result_keys
+            if unexpected_keys:
+                raise RuntimeError(
+                    "Cannot merge microbatched rollout result keys: "
+                    f"{sorted(unexpected_keys)}"
+                )
+            rollout_results.append(
+                RolloutResult(
+                    actions=actions,
+                    prev_logprobs=result.get("prev_logprobs"),
+                    prev_values=result.get("prev_values"),
+                    intervene_flags=result.get("intervene_flags"),
+                    forward_inputs=result.get("forward_inputs", {}),
+                )
+            )
+            expert_label_flags.append(bool(result.get("expert_label_flag", False)))
+
+        merged = RolloutResult.merge_rollout_results(rollout_results)
+        return merged.actions, {
+            "prev_logprobs": merged.prev_logprobs,
+            "prev_values": merged.prev_values,
+            "forward_inputs": merged.forward_inputs,
+            "intervene_flags": merged.intervene_flags,
+            "expert_label_flag": any(expert_label_flags),
+        }
+
     def _predict_rollout_actions(
         self,
         env_obs: dict[str, Any],
@@ -631,7 +966,7 @@ class MultiStepRolloutWorker(Worker):
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
             )
-        return self.predict(env_obs, mode=mode)
+        return self._predict_microbatched(env_obs, mode)
 
     def _build_rollout_result(
         self,
@@ -857,7 +1192,7 @@ class MultiStepRolloutWorker(Worker):
                     timeout_time=0.02,
                     recv_queue_size=self.rollout_queue_size,
                 )
-                actions, _ = self._predict_rollout_actions(
+                actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     mode="eval",
                     final_obs=env_output.get("final_obs", None),
@@ -866,11 +1201,16 @@ class MultiStepRolloutWorker(Worker):
                 )
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().contiguous()
+                rollout_result = RolloutResult(
+                    actions=actions,
+                    forward_inputs=result.get("forward_inputs", {}),
+                )
                 self.send_to_recorded_batch_routes(
                     group_name=self.cfg.env.group_name,
                     channel=output_channel,
-                    data=actions,
+                    data=rollout_result,
                     tag="rollout_results",
+                    split_fn=self._split_rollout_result,
                     split_sizes=split_sizes,
                 )
         else:
@@ -891,7 +1231,7 @@ class MultiStepRolloutWorker(Worker):
                             merge_fn=self._merge_obs_batches,
                             infer_batch_size_fn=self._infer_env_batch_size,
                         ).async_wait()
-                        actions, _ = self._predict_rollout_actions(
+                        actions, result = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
                             final_obs=env_output.get("final_obs", None),
@@ -900,14 +1240,19 @@ class MultiStepRolloutWorker(Worker):
                         )
                         if isinstance(actions, torch.Tensor):
                             actions = actions.detach().cpu().contiguous()
+                        rollout_result = RolloutResult(
+                            actions=actions,
+                            forward_inputs=result.get("forward_inputs", {}),
+                        )
                         self.send_to(
                             group_name=self.cfg.env.group_name,
                             channel=output_channel,
-                            data=actions,
+                            data=rollout_result,
                             tag="eval_rollout_results",
                             route_key=stage_id,
                             async_op=True,
                             batch_size=self.eval_batch_size,
+                            split_fn=self._split_rollout_result,
                         )
 
             if self.enable_offload:

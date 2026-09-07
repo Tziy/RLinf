@@ -96,19 +96,32 @@ class EmbodiedEvalRunner:
             env_metrics_list, deduplicate_trials=True
         )
         eval_metrics.update(rollout_metrics)
+        env_time_metrics = env_handle.consume_durations()
+        rollout_time_metrics = rollout_handle.consume_durations()
+        self._last_time_metrics = {
+            **{f"time/env/{key}": value for key, value in env_time_metrics.items()},
+            **{
+                f"time/rollout/{key}": value
+                for key, value in rollout_time_metrics.items()
+            },
+        }
         return eval_metrics
 
     def run(self):
         start_time = time.time()
         eval_metrics = self.evaluate()
         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-        self.logger.info(eval_metrics)
-        self.metric_logger.log(step=0, data=eval_metrics)
+        logging_metrics = {
+            **eval_metrics,
+            **getattr(self, "_last_time_metrics", {}),
+        }
+        self.logger.info(logging_metrics)
+        self.metric_logger.log(step=0, data=logging_metrics)
         print_metrics_table(
             step=0,
             total_steps=1,
             start_time=start_time,
-            metrics=eval_metrics,
+            metrics=logging_metrics,
             log_path=self.metric_logger.log_path,
         )
 

@@ -338,7 +338,7 @@ def compute_ppo_critic_loss(
     values: torch.Tensor,
     returns: torch.Tensor,
     prev_values: torch.Tensor,
-    value_clip: float,
+    value_clip: Optional[float],
     huber_delta: float,
     loss_mask: Optional[torch.Tensor] = None,
     max_episode_steps: Optional[int] = None,
@@ -380,23 +380,33 @@ def compute_ppo_critic_loss(
         loss_mask_ratio = (loss_mask_sum * 1.0) / max_episode_steps
         loss_agg_func = masked_mean_ratio
 
-    value_pred_clipped = prev_values + (values - prev_values).clamp(
-        -value_clip, value_clip
-    )  # [bsz, ] | [bsz, chunk-step]
-
     value_loss_original = huber_loss(
         returns - values, huber_delta
     )  # [bsz, ] | [bsz, chunk-step]
-    value_loss_clipped = huber_loss(
-        returns - value_pred_clipped, huber_delta
-    )  # [bsz, ] | [bsz, chunk-step]
-    value_loss = torch.max(value_loss_original, value_loss_clipped)
-    value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
+    if value_clip is None:
+        # A randomly initialized critic has no meaningful previous prediction to
+        # anchor. Warmup explicitly disables value clipping so the head can fit
+        # Monte Carlo returns before it is used as the GAE baseline.
+        value_loss = loss_agg_func(value_loss_original, loss_mask, loss_mask_ratio)
+        value_clip_ratio = torch.zeros(
+            (), device=values.device, dtype=torch.float32
+        )
+    else:
+        value_pred_clipped = prev_values + (values - prev_values).clamp(
+            -value_clip, value_clip
+        )  # [bsz, ] | [bsz, chunk-step]
+        value_loss_clipped = huber_loss(
+            returns - value_pred_clipped, huber_delta
+        )  # [bsz, ] | [bsz, chunk-step]
+        value_loss = torch.max(value_loss_original, value_loss_clipped)
+        value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
 
-    # Measure the unclipped update; checking value_pred_clipped here is
-    # always false by construction and hides active value clipping.
-    value_clip_indicator = (values - prev_values).abs() > value_clip
-    value_clip_ratio = _safe_masked_mean(value_clip_indicator.float(), loss_mask)
+        # Measure the unclipped update; checking value_pred_clipped here is
+        # always false by construction and hides active value clipping.
+        value_clip_indicator = (values - prev_values).abs() > value_clip
+        value_clip_ratio = _safe_masked_mean(
+            value_clip_indicator.float(), loss_mask
+        )
 
     explained_variance_stats = compute_critic_explained_variance_stats(
         returns=returns,

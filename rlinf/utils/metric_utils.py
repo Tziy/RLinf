@@ -432,25 +432,63 @@ def write_evaluate_trials(eval_metrics_list, output_path: str) -> int:
     if any(tensor.numel() != num_rows for tensor in tensors.values()):
         raise ValueError("task_id, trial_id, and success_once must have equal lengths")
 
+    optional_keys = (
+        "semantic_age",
+        "requested_semantic_age",
+        "semantic_age_bootstrap_clipped",
+        "semantic_boundary_count",
+        "semantic_bootstrap_clipped_boundary_count",
+        "semantic_requested_actual_age_mismatch_boundary_count",
+        "semantic_actual_age_mean",
+        "semantic_actual_age_min",
+        "semantic_actual_age_max",
+        "policy_noise_seed",
+        "action_execution_horizon",
+    )
+    optional_tensors = {}
+    for key in optional_keys:
+        shards = [
+            _normalize_metric_shard(metrics[key])
+            for metrics in eval_metrics_list
+            if key in metrics
+        ]
+        if not shards:
+            continue
+        optional_tensors[key] = torch.concat(shards)
+        if optional_tensors[key].numel() != num_rows:
+            raise ValueError(
+                f"Optional eval audit field {key} must have {num_rows} rows, "
+                f"got {optional_tensors[key].numel()}"
+            )
+
     seen_trials: set[tuple[int, int]] = set()
     rows = []
-    for task_id, trial_id, success in zip(
-        tensors["task_id"].tolist(),
-        tensors["trial_id"].tolist(),
-        tensors["success_once"].tolist(),
-        strict=True,
+    for row_index, (task_id, trial_id, success) in enumerate(
+        zip(
+            tensors["task_id"].tolist(),
+            tensors["trial_id"].tolist(),
+            tensors["success_once"].tolist(),
+            strict=True,
+        )
     ):
         trial_key = (int(task_id), int(trial_id))
         if trial_key in seen_trials:
             continue
         seen_trials.add(trial_key)
-        rows.append(
-            {
-                "task_id": trial_key[0],
-                "trial_id": trial_key[1],
-                "success": bool(success),
-            }
-        )
+        row = {
+            "task_id": trial_key[0],
+            "trial_id": trial_key[1],
+            "success": bool(success),
+        }
+        for key, tensor in optional_tensors.items():
+            value = tensor[row_index].item()
+            if key == "semantic_age_bootstrap_clipped":
+                row[key] = bool(value)
+            elif key == "semantic_actual_age_mean":
+                row[key] = float(value)
+            else:
+                row[key] = int(value)
+        rows.append(row)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     tmp_path = f"{output_path}.tmp"

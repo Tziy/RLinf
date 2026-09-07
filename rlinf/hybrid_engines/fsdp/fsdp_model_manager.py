@@ -59,6 +59,40 @@ warnings.filterwarnings(
 )
 
 
+def override_optimizer_lrs_after_resume(
+    optimizer: Optimizer,
+    lr_scheduler: LRScheduler | None,
+    configured_lrs: list[float],
+) -> None:
+    """Keep loaded optimizer moments but use explicitly configured resume LRs."""
+    normalized_lrs = [float(lr) for lr in configured_lrs]
+    if len(optimizer.param_groups) != len(normalized_lrs):
+        raise ValueError(
+            "Optimizer parameter-group count does not match configured resume "
+            f"learning rates: {len(optimizer.param_groups)} != {len(normalized_lrs)}"
+        )
+
+    scheduler_base_lrs = getattr(lr_scheduler, "base_lrs", None)
+    if scheduler_base_lrs is not None and len(scheduler_base_lrs) != len(
+        normalized_lrs
+    ):
+        raise ValueError(
+            "LR scheduler base_lrs count does not match configured resume "
+            f"learning rates: {len(scheduler_base_lrs)} != {len(normalized_lrs)}"
+        )
+
+    for group, lr in zip(optimizer.param_groups, normalized_lrs):
+        group["lr"] = lr
+        if "initial_lr" in group:
+            group["initial_lr"] = lr
+
+    if lr_scheduler is not None:
+        if scheduler_base_lrs is not None:
+            lr_scheduler.base_lrs = normalized_lrs.copy()
+        if hasattr(lr_scheduler, "_last_lr"):
+            lr_scheduler._last_lr = normalized_lrs.copy()
+
+
 class FSDPModelManager:
     """
     FSDP Model Manager for RL training
@@ -303,9 +337,7 @@ class FSDPModelManager:
         )
         self.optimizer = self.build_optimizer(
             model=self.model,
-            enable_critic_warmup=(
-                self.critic_warmup_steps > 0
-            ),
+            enable_critic_warmup=(self.critic_warmup_steps > 0),
         )
 
         self.lr_scheduler = self.build_lr_scheduler(
@@ -356,9 +388,27 @@ class FSDPModelManager:
             self.load_optimizer(self.device)
             self.is_optimizer_offloaded = False
 
+        configured_lrs = None
+        if self._cfg.optim.get("override_lr_on_resume", False):
+            configured_lrs = [
+                float(group["lr"]) for group in self.optimizer.param_groups
+            ]
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+
+        if configured_lrs is not None:
+            restored_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
+            override_optimizer_lrs_after_resume(
+                self.optimizer, self.lr_scheduler, configured_lrs
+            )
+            self._logger.info(
+                "[FSDP] Overrode checkpoint optimizer learning rates %s with "
+                "configured rates %s after resume.",
+                restored_lrs,
+                configured_lrs,
+            )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """

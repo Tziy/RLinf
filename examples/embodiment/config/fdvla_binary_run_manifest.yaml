@@ -1,0 +1,468 @@
+schema_version: 1
+primary_method: D-PPO
+initial_checkpoint:
+  path_env: GR00T_MODEL_PATH
+  require_absolute_path: true
+  record_sha256: true
+development_initial_checkpoint_screen:
+  purpose: avoid_ceiling_effect_before_formal_pilot
+  formal_result: false
+  candidates:
+    weak1000:
+      path_env: FDVLA_SCREEN_CKPT_WEAK1000
+      recorded_training_step: 1000
+    weak1500:
+      path_env: FDVLA_SCREEN_CKPT_WEAK1500
+      recorded_training_step: 1500
+    weak1000plus500:
+      path_env: FDVLA_SCREEN_CKPT_WEAK1000PLUS500
+      recorded_training_step: 500
+      note: continuation lineage must remain explicit; do not interpret as total exposure
+  excluded_candidates:
+    weak2000: embodiment_id fingerprint differs from the common checkpoint family
+  paired_condition:
+    task_id: 0
+    semantic_age_frames: 6
+    action_execution_horizon: 8
+    action_prediction_horizon: 16
+    policy_noise_seed: 12026
+    unique_trials: 50
+  selection_rule:
+    target_success_rate: 0.45
+    preferred_interval: [0.30, 0.60]
+    primary: minimize_absolute_distance_to_target_success_rate
+    tie_break_order: [weak1500, weak1000plus500, weak1000]
+    correctness_requirements:
+      nonbootstrap_requested_actual_age_mismatches: 0
+      cross_episode_packet_mismatches: 0
+      local_vlm_forward_count: 0
+  isolation:
+    selection_policy_noise_seed_must_not_enter_formal_eval: true
+    formal_eval_policy_noise_seeds: [2026, 2027, 2028, 2029, 2030, 2031, 2032, 2033]
+    selection_results_must_be_labeled_development: true
+    selected_checkpoint_must_be_locked_for_all_methods: true
+  observed_after_preregistration:
+    formal_result: false
+    report: logs/fdvla_initial_checkpoint_screen/20260821_codefrozen_v2_age6_ka8_noise12026/selection_report.json
+    worktree_sha256: 8fa77902ed3d4d1c2ce1f8113434790f5750260819be63480a2e38d866d79ab0
+    results:
+      weak1000: {successes: 15, trials: 50, success_rate: 0.30}
+      weak1500: {successes: 40, trials: 50, success_rate: 0.80}
+      weak1000plus500: {successes: 8, trials: 50, success_rate: 0.16}
+    selected: weak1000
+    selected_checkpoint:
+      path: /vepfs-mlp2/c20250301/240403026/async_vla/async_libero_runs/libero10_decoupled_sft_0to8_rebuilt/W1000_libero10_decoupled_0to8_scalar_age_s4_a4/libero10_delay0to8_s4_a4_weak1000/checkpoint-1000
+      sha256: edff533a5c7b9472739577f0b4de8c0bb39f6a93815aad30ec40784538d1adbf
+    note: recorded after the code-frozen screen; it does not modify the preregistered rule
+development_pilot_observed_after_preregistration:
+  formal_result: false
+  label: weak1000_task0_seed0_age6_ka8_noise2026
+  common_condition:
+    task_id: 0
+    semantic_age_frames: 6
+    action_execution_horizon: 8
+    action_prediction_horizon: 16
+    policy_noise_seed: 2026
+    unique_trials: 48
+  common_provenance:
+    git_sha: a6d8747a0661fe7ca7ff1a9f7a284d2d75594afa
+    worktree_sha256: cf2ed5bb3f1ec211e649b110bf545ca8a5f1a27b7d2313580b6dbe09340b4b31
+    initial_checkpoint_sha256: edff533a5c7b9472739577f0b4de8c0bb39f6a93815aad30ec40784538d1adbf
+    backbone_sha256: fd4ba5e5215d5861387cf7bca0cf0df1f231a5be6deff5a8673862dcb1ca4220
+  D-SFT:
+    successes: 13
+    trials: 48
+    success_rate: 0.2708333333333333
+    trial_jsonl_sha256: 8349a68461351a0c303aca713c8bd3404e395c1c9b4e2f4fd23ce11995002113
+    surface_manifest: logs/fdvla_realtime_surface/20260821_weak1000_dsft_fresh_age6_ka8_noise2026/surface_cells.tsv
+  D-PPO:
+    training_seed: 0
+    update: 50
+    successes: 18
+    trials: 48
+    success_rate: 0.375
+    checkpoint_sha256: ade2858d1bf13e062947e227d00d12159c4dbdcc08b1464f7d087497cbafca8f
+    trial_jsonl_sha256: b60ccaa8fd7010601fc436a6f9beca4110a325dd0387184caa981d8ac630a215
+    surface_manifest: logs/fdvla_realtime_surface/20260821_weak1000_dppo_step50_currenttree_age6_ka8_noise2026/surface_cells.tsv
+  paired_result:
+    failure_to_success: 9
+    success_to_failure: 4
+    success_rate_delta: 0.10416666666666669
+    exact_mcnemar_p: 0.266845703125
+    identity_mismatch_count: 0
+    actual_age_contract_violation_count: 0
+    summary: logs/20260821-weak1000-dppo-seed0-libero_10_fdvla_binary_ppo/analysis_final/realtime_weak1000_paired_age6_ka8/fdvla_realtime_surface.json
+    development_closure_audit: logs/20260821-weak1000-dppo-seed0-libero_10_fdvla_binary_ppo/analysis_final/development_closure_audit.json
+  limitations:
+    - one_training_seed
+    - 48_trials_below_formal_400_trial_floor
+    - one_surface_cell_only
+development_realtime_surface_preregistered:
+  formal_result: false
+  label: weak1000_task0_full_surface
+  methods: [D-SFT, D-PPO-step50]
+  task_id: 0
+  semantic_age_frames: [0, 1, 2, 4, 6, 8, 12, 16]
+  action_execution_horizon: [1, 2, 4, 8, 16]
+  action_prediction_horizon: 16
+  policy_noise_seeds: [14026]
+  unique_trials_per_cell: 48
+  pairing_fields:
+    - task_id
+    - trial_id
+    - requested_semantic_age
+    - action_execution_horizon
+    - policy_noise_seed
+  note: development response surface; it is not the >=400-trial final surface
+development_success_early_stop_preregistered:
+  formal_result: false
+  label: weak1000_seed0_continue_from_step50_target80
+  parent_checkpoint:
+    global_step: 50
+    path: logs/20260821-weak1000-dppo-seed0-libero_10_fdvla_binary_ppo/fdvla_binary_d_ppo_weak1000_task0_seed0/checkpoints/global_step_50
+    actor_full_weights_sha256: ade2858d1bf13e062947e227d00d12159c4dbdcc08b1464f7d087497cbafca8f
+  selection_condition:
+    task_id: 0
+    semantic_age_frames: 6
+    action_execution_horizon: 8
+    action_prediction_horizon: 16
+    policy_noise_seed: 13026
+    unique_trials: 48
+  stopping_rule:
+    metric: eval/success_once
+    first_evaluation_at_or_above: 0.75
+    desired_reporting_band: [0.75, 0.85]
+    evaluation_interval_updates: 10
+    maximum_global_step: 150
+    overshoot_policy: stop_at_first_crossing_and_report_overshoot_without_rewinding
+    no_hit_policy: stop_at_maximum_global_step_and_report_target_not_reached
+  held_out_final_condition:
+    task_id: 0
+    semantic_age_frames: 6
+    action_execution_horizon: 8
+    action_prediction_horizon: 16
+    policy_noise_seed: 13027
+    unique_trials: 48
+    fresh_process: true
+    checkpoint_selection_forbidden: true
+  isolation:
+    initial_screen_noise_seed: 12026
+    prior_development_noise_seed: 2026
+    response_surface_noise_seed: 14026
+    selection_and_held_out_noise_are_disjoint: true
+    held_out_result_must_not_change_selected_checkpoint: true
+  caveat: the held-out evaluation uses the same 48 fixed Task-0 reset states with a disjoint policy-noise seed; it is condition-level rather than reset-state-level isolation
+development_system_tuning_preregistered:
+  formal_result: false
+  label: weak1000_task0_dppo_lossless_system_tuning
+  timing_workload:
+    task_id: 0
+    train_envs: 60
+    rollout_epochs_per_update: 4
+    frames_per_rollout_epoch: 256
+    global_batch_size: 384
+    stable_sample_minimum: 3
+    warmup_updates_excluded: 2
+    evaluation_enclosing_updates_excluded: true
+  fixed_scientific_contract:
+    reward: first_terminal_success_binary
+    semantic_train_age_frames: [0, 6]
+    action_prediction_horizon: 16
+    denoising_steps: 4
+    ppo_algorithm_unchanged: true
+    exact_age_selected_packet_must_be_identical: true
+  primary_candidates:
+    - actor4_rollout3_double_fetch
+    - colocated4_double_fetch
+    - actor4_rollout3_single_exact_fetch
+    - colocated4_single_exact_fetch
+  fallback_candidates_if_no_primary_beats_coupled:
+    - actor4_rollout3_single_exact_fetch_batch2
+    - colocated4_single_exact_fetch_batch2
+  allowed_system_differences:
+    actor4_rollout3: GPU0 semantic server, GPU1-3 DiT rollout, GPU0-3 actor update
+    colocated4: GPU0 semantic server plus one DiT rank, GPU0-3 DiT rollout and actor update
+    single_exact_fetch: skip only the latest packet transfer immediately replaced by the exact-age packet; preserve the exact packet tensor written to PPO
+    batch2: coalesce at most two compatible semantic requests without changing requested source frame IDs
+  selection_rule:
+    primary: minimum_mean_stable_time_per_step
+    success_metric_forbidden: true
+    require_same_initial_checkpoint: true
+    require_same_backbone: true
+    require_same_hardware: true
+    required_zero_counts:
+      nonfinite_scalars: 0
+      reward_model_invocations: 0
+      trainable_vlm_parameters: 0
+      local_vlm_forwards: 0
+      cross_episode_packet_mismatches: 0
+      rollout_train_semantic_fingerprint_mismatches: 0
+    speed_endpoint: selected_d_time_per_step_less_than_paired_c
+  quality_guard:
+    selection_does_not_use_policy_success: true
+    selected_system_configuration_is_locked_before_target80_continuation: true
+    held_out_noise_seed: 13027
+    held_out_result_cannot_change_selection: true
+
+formal_task0_bf16_tail4_protocol:
+  status: registered_before_formal_runs
+  intended_formal_result: true
+  protocol_id: task0_k2_bf16_tail4_binary_v1
+  registration_context:
+    current_d_development_observed_through_update: 9
+    current_c_development_started: false
+    current_development_pair_eligible_for_formal_result: false
+    exclusion_reasons:
+      - d_start_was_selected_on_the_same_policy_noise_seed_used_for_development_eval
+      - c_and_d_recorded_different_worktree_fingerprints
+      - development_d_eval_used_natural_age_and_is_not_fixed_age_paired
+  matched_start_selection:
+    task_id: 0
+    target_successes: 13
+    trials: 48
+    maximum_distance_from_target_successes: 4
+    maximum_c_d_gap_successes: 4
+    action_execution_horizon: 2
+    semantic_age_frames: 0
+    selection_policy_noise_seed: 14026
+    checkpoint_identity: architecture_specific_sft_checkpoints_not_byte_identical
+    shared_pretraining_lineage_must_be_recorded: true
+    performance_matching_replaces_exact_checkpoint_matching: true
+    c_checkpoint_contract: native_coupled_forward_without_delay_adapters
+    d_checkpoint_contract: decoupled_forward_with_required_age_history_adapters
+    c_candidate_sft_steps: [1, 2, 3, 4, 5]
+    d_candidate_sft_steps: [10, 20, 30, 40, 50]
+    fallback_if_no_eligible_pair_is_predeclared: true
+    fallback_c_candidate_sft_steps: [6, 7, 8, 9, 10]
+    fallback_d_candidate_sft_steps: [60, 70, 80, 90, 100]
+    changing_target_or_thresholds_after_candidate_results: forbidden
+    candidate_choice_rule: eligible_joint_pair_minimax_deviation_then_sum_deviation_then_gap_then_combined_sft_steps
+    selection_metric_must_not_be_reused_for_training_or_final_eval: true
+    require_same_task_trial_noise_age_condition: true
+    require_same_worktree_for_all_candidates_and_training: true
+  training:
+    methods: [C-PPO, D-PPO]
+    training_seeds: [0, 1, 2]
+    fixed_final_checkpoint_update: 50
+    best_checkpoint_selection: forbidden
+    train_envs: 60
+    train_rollout_epochs_per_update: 4
+    train_frames_per_rollout_epoch: 256
+    max_episode_steps: 480
+    global_batch_size: 960
+    micro_batch_size: 2
+    ppo_update_epochs: 1
+    actor_lr: 5.0e-7
+    value_lr: 2.0e-5
+    kl_beta: 0.0
+    gamma: 0.99
+    gae_lambda: 0.95
+    actor_precision: bf16
+    rollout_precision: bf16
+    dit_train_last_n_blocks: 4
+    train_value_head: true
+    c_trainable_scope: [dit_last_4_blocks, value_head]
+    d_trainable_scope: [dit_last_4_blocks, packet_age_adapter, action_history_adapter, value_head]
+    c_delay_adapter_construction: forbidden
+    d_delay_adapter_construction: required
+    vlm_trainable_parameters: 0
+    action_prediction_horizon: 16
+    action_execution_horizon: 2
+    denoising_steps: 4
+    semantic_publish_interval_frames: 8
+    d_training_semantic_mode: natural_async_latest_nonblocking
+    c_training_semantic_mode: current_frame_local_frozen_vlm
+    posthoc_augmentation_enabled: false
+  learning_curve_evaluation:
+    interval_updates: 5
+    task_id: 0
+    trials: 48
+    policy_noise_seed: 27026
+    semantic_age_frames: 0
+    action_execution_horizon: 2
+    paired_fields: [task_id, trial_id, requested_semantic_age, action_execution_horizon, policy_noise_seed]
+    primary_wallclock: cumulative_time_step_minus_periodic_evaluation
+    secondary_wallclock: raw_elapsed_including_periodic_evaluation
+    environment_frame_budget_per_update: 61440
+  final_evaluation:
+    checkpoint_update: 50
+    fresh_process: true
+    task_id: 0
+    fixed_trial_ids: 50
+    policy_noise_seeds: [2026, 2027, 2028, 2029, 2030, 2031, 2032, 2033]
+    trials_per_training_seed_and_condition: 400
+    fixed_semantic_age_frames: [0, 2, 4, 6, 8, 12]
+    natural_async_schedule_reported_separately: true
+    checkpoint_selection_from_final_trials: forbidden
+  timing_selection:
+    status: registered_before_batching_runs
+    success_metric_forbidden: true
+    fixed_placement: colocated_4_semantic_servers_plus_4_dit_rollout_ranks
+    candidates:
+      - {id: batch1, max_requests: 1, target_requests: 1, wait_ms: 0}
+      - {id: batch2, max_requests: 2, target_requests: 2, wait_ms: 1}
+      - {id: batch4, max_requests: 4, target_requests: 4, wait_ms: 2}
+    workload:
+      task_id: 0
+      train_envs: 60
+      rollout_epochs_per_update: 4
+      frames_per_rollout_epoch: 256
+      updates: 6
+      warmup_updates_excluded: 2
+      final_evaluation_enclosing_update_excluded: 1
+      stable_updates_required: 3
+      actor_precision: bf16
+      rollout_precision: bf16
+      dit_train_last_n_blocks: 4
+      action_execution_horizon: 2
+    primary_metric: mean_training_wallclock_per_update
+    tie_breakers: [mean_rollout_wallclock, semantic_queue_latency_p95, candidate_order]
+    required_health_gates: [finite_scalars, zero_reward_model_calls, zero_trainable_vlm, zero_cross_episode_mismatch, zero_semantic_replay_mismatch]
+    selected_batching_must_be_frozen_before_matched_start_selection: true
+  posthoc_pair:
+    control_weight: 0.0
+    augmentation_weight: 0.01
+    same_rollout_and_replay_compute_control: true
+    run_only_after_base_c_d_protocol_is_frozen: true
+  correctness_gates:
+    nonfinite_scalars: 0
+    reward_model_invocations: 0
+    trainable_vlm_parameters: 0
+    cross_episode_packet_mismatches: 0
+    rollout_train_semantic_fingerprint_mismatches: 0
+    final_fixed_age_nonbootstrap_mismatches: 0
+
+common:
+  suite: libero_10
+  reward: first_terminal_success_binary
+  loss_type: actor_critic
+  adv_type: gae
+  group_size: 1
+  action_horizon: 16
+  execution_horizon: 16
+  realtime_surface:
+    semantic_age_frames: [0, 1, 2, 4, 6, 8, 12, 16]
+    action_execution_horizon: [1, 2, 4, 8, 16]
+    control_hz: 20
+    paired_fields:
+      - task_id
+      - trial_id
+      - requested_semantic_age
+      - action_execution_horizon
+      - policy_noise_seed
+  denoising_steps: 4
+  task_trial_age_noise_pairing: true
+  policy_noise_seed_env: EVAL_NOISE_SEED
+  trainable_scope_is_method_specific: true
+methods:
+  C-SFT:
+    config: libero_10_coupled_n1d7_binary_ppo
+    ppo: false
+    only_eval: true
+    semantic_mode: current_frame
+  D-SFT:
+    config: libero_10_fdvla_binary_ppo
+    ppo: false
+    only_eval: true
+    semantic_mode: natural_async_or_age_0_6
+  C-PPO:
+    config: libero_10_coupled_n1d7_binary_ppo
+    ppo: true
+    semantic_mode: current_frame
+    trainable_scope: [dit_tail, value_head]
+    delay_adapters: absent
+  D-PPO:
+    config: libero_10_fdvla_binary_ppo
+    ppo: true
+    semantic_mode: natural_async_or_age_0_6
+    trainable_scope: [dit_tail, packet_age_adapter, action_history_adapter, value_head]
+    delay_adapters: required
+
+  D-PPO-PosthocAug:
+    config: libero_10_fdvla_binary_ppo
+    ppo: true
+    semantic_mode: natural_async_latest
+    overrides:
+      POSTHOC_SEMANTIC_DELAY_ENABLED: true
+      POSTHOC_SEMANTIC_DELAY_WEIGHT: 0.01
+      POSTHOC_ALLOW_HINDSIGHT_COMPLETION: true
+      POSTHOC_REQUIRE_NONBLOCKING_ROLLOUT: true
+      POSTHOC_SEMANTIC_DELAY_BANK_ENABLED: false
+      SEMANTIC_TRAIN_RANDOM_AGE_MIN_FRAMES: -1
+      SEMANTIC_TRAIN_RANDOM_AGE_MAX_FRAMES: -1
+      SEMANTIC_ENV_BOUNDARY_PUBLISH: false
+    augmentation_contract:
+      same_env_and_episode_generation: true
+      semantic_source_not_after_current_frame: true
+      semantic_source_not_from_future_frame: true
+      hindsight_completion_explicitly_labeled: true
+      hindsight_rows_excluded_from_main_ppo: true
+      actual_age_recomputed_from_frame_ids: true
+      ppo_eligible: false
+      old_logprob_reuse: forbidden
+      semantic_server_or_vlm_call_during_update: forbidden
+      missing_candidate_behavior: skip
+      rollout_semantic_source: latest_completed_packet
+      augmentation_source: rollout_buffer_only
+      objective: separate_logprob_consistency_auxiliary
+  D-PPO-PosthocControl:
+    config: libero_10_fdvla_binary_ppo
+    ppo: true
+    semantic_mode: natural_async_latest
+    overrides:
+      POSTHOC_SEMANTIC_DELAY_ENABLED: true
+      POSTHOC_SEMANTIC_DELAY_WEIGHT: 0.0
+      POSTHOC_FORCE_REPLAY_FORWARD: true
+      POSTHOC_ALLOW_HINDSIGHT_COMPLETION: true
+      POSTHOC_REQUIRE_NONBLOCKING_ROLLOUT: true
+      POSTHOC_SEMANTIC_DELAY_BANK_ENABLED: false
+      SEMANTIC_TRAIN_RANDOM_AGE_MIN_FRAMES: -1
+      SEMANTIC_TRAIN_RANDOM_AGE_MAX_FRAMES: -1
+      SEMANTIC_ENV_BOUNDARY_PUBLISH: false
+    purpose: same_replay_forward_zero_weight_control_for_posthoc_augmentation
+  D-PPO-Fresh:
+    config: libero_10_fdvla_binary_ppo
+    ppo: true
+    semantic_mode: blocking_exact_age_0
+    overrides:
+      SEMANTIC_TRAIN_RANDOM_AGE_MIN_FRAMES: 0
+      SEMANTIC_TRAIN_RANDOM_AGE_MAX_FRAMES: 0
+      SEMANTIC_EVAL_FIXED_AGE_FRAMES: 0
+      SEMANTIC_EVAL_RANDOM_AGE_MIN_FRAMES: -1
+      SEMANTIC_EVAL_RANDOM_AGE_MAX_FRAMES: -1
+      SEMANTIC_FETCH_TARGET_AGE_FRAMES: 0
+      SEMANTIC_FETCH_HARD_MAX_AGE_FRAMES: 0
+  D-PPO-NoAge:
+    config: libero_10_fdvla_binary_ppo
+    ppo: true
+    semantic_mode: age_0_6_zero_age_input
+    hydra_overrides:
+      actor.model.rl_head_config.semantic_zero_packet_age: true
+  D-PPO-NoHistory:
+    config: libero_10_fdvla_binary_ppo
+    ppo: true
+    semantic_mode: age_0_6_zero_history_input
+    hydra_overrides:
+      actor.model.rl_head_config.semantic_zero_action_history: true
+comparisons:
+  equal_total_gpu_budget:
+    total_gpus: 4
+    decoupled: "GPU0 semantic server; GPU1-3 actor/rollout/env"
+    coupled: "GPU0-3 legal coupled placement"
+  isomorphic_server_control:
+    total_gpus: 4
+    placement: "GPU0 semantic server; GPU1-3 DiT"
+    methods: [D-PPO, D-PPO-Fresh]
+
+  posthoc_delay_augmentation:
+    methods: [D-PPO-PosthocControl, D-PPO-PosthocAug]
+    same_rollout_delay_distribution: true
+    main_ppo_samples_identical_contract: true
+    only_registered_difference: posthoc_consistency_loss_weight_0_vs_0.01
+  posthoc_delay_augmentation_cost:
+    methods: [D-PPO, D-PPO-PosthocControl]
+    purpose: quantify_extra_boundary_publish_rpc_buffer_and_replay_cost
+pre_registered_endpoints:
+  - D-PPO_minus_D-SFT_final_success
+  - D-PPO_minus_C-PPO_wallclock_auc
+  - success_degradation_age_0_12

@@ -1072,9 +1072,7 @@ class Gr00tN1d7SemanticCacheClient:
         try:
             response = future.result(
                 timeout=(
-                    None
-                    if timeout_ms is None
-                    else max(0.0, float(timeout_ms)) / 1000.0
+                    None if timeout_ms is None else max(0.0, float(timeout_ms)) / 1000.0
                 )
             )
         except concurrent.futures.TimeoutError:
@@ -1255,9 +1253,11 @@ class Gr00tN1d7RawObservationPublisher:
         self._lock = threading.RLock()
         self._future: concurrent.futures.Future | None = None
         self._queued: tuple[dict[str, Any], dict[str, Any]] | None = None
+        self._preserved_queue: deque[tuple[dict[str, Any], dict[str, Any]]] = deque()
         self._error: BaseException | None = None
         self._closed = False
         self.replaced_count = 0
+        self.preserved_count = 0
 
     @staticmethod
     def _slice_nested(value: Any, indices: list[int], batch_size: int) -> Any:
@@ -1355,12 +1355,21 @@ class Gr00tN1d7RawObservationPublisher:
                 self._error = error
                 self._queued = None
                 return
-            queued = self._queued
-            self._queued = None
+            if self._preserved_queue:
+                queued = self._preserved_queue.popleft()
+            else:
+                queued = self._queued
+                self._queued = None
             if queued is not None and not self._closed:
                 self._launch_locked(*queued)
 
-    def publish(self, observation: dict[str, Any], metadata: dict[str, Any]) -> None:
+    def publish(
+        self,
+        observation: dict[str, Any],
+        metadata: dict[str, Any],
+        *,
+        preserve_all: bool = False,
+    ) -> None:
         snapshot = _snapshot_nested_cpu(observation)
         with self._lock:
             if self._closed:
@@ -1369,6 +1378,10 @@ class Gr00tN1d7RawObservationPublisher:
                 raise RuntimeError("Raw semantic publish failed") from self._error
             if self._future is None:
                 self._launch_locked(snapshot, dict(metadata))
+                return
+            if preserve_all:
+                self._preserved_queue.append((snapshot, dict(metadata)))
+                self.preserved_count += 1
                 return
             self._queued = (snapshot, dict(metadata))
             self.replaced_count += 1
@@ -1382,6 +1395,7 @@ class Gr00tN1d7RawObservationPublisher:
         with self._lock:
             self._closed = True
             self._queued = None
+            self._preserved_queue.clear()
             future = self._future
         if future is not None:
             future.cancel()
@@ -1632,7 +1646,7 @@ class Gr00tN1d7SemanticBackbonePolicy:
         self.latest_by_env: dict[tuple[str, int], dict[str, Any]] = {}
         self.pending_by_env: dict[int, dict[str, Any]] = {}
         self.pending_batches: dict[tuple[int, ...], dict[str, Any]] = {}
-        self.pending_raw_batches: dict[tuple[int, ...], dict[str, Any]] = {}
+        self.pending_raw_batches: dict[tuple[Any, ...], dict[str, Any]] = {}
         self._cache_lock = threading.RLock()
         self.semantic_cache_by_env: dict[int, dict[str, Any]] = {}
         self.semantic_cache_history_by_env: dict[int, deque[dict[str, Any]]] = {}
@@ -1654,7 +1668,15 @@ class Gr00tN1d7SemanticBackbonePolicy:
             env_id, deque(maxlen=self.cache_history_size)
         )
         history.append(cache_entry)
-        self.semantic_cache_by_env[env_id] = cache_entry
+        latest = self.semantic_cache_by_env.get(env_id)
+        if latest is None or (
+            cache_entry["episode_generation"],
+            cache_entry["source_frame_id"],
+        ) >= (
+            latest["episode_generation"],
+            latest["source_frame_id"],
+        ):
+            self.semantic_cache_by_env[env_id] = cache_entry
 
     @staticmethod
     def _input_signature(inputs: BatchFeature) -> tuple:
@@ -1751,6 +1773,7 @@ class Gr00tN1d7SemanticBackbonePolicy:
             .reshape(-1)
             .tolist()
         )
+        preserve_all = bool(metadata.get("semantic_preserve_all", False))
         if not all(
             len(values) == batch_size
             for values in (env_ids, frame_ids, generations, wallclocks)
@@ -1763,17 +1786,28 @@ class Gr00tN1d7SemanticBackbonePolicy:
             generation = int(generations[row])
             frame_id = int(frame_ids[row])
             cached = self.semantic_cache_by_env.get(env_id)
-            if cached is not None and (
-                generation < cached["episode_generation"]
-                or (
-                    generation == cached["episode_generation"]
-                    and frame_id < cached["source_frame_id"]
+            if (
+                not preserve_all
+                and cached is not None
+                and (
+                    generation < cached["episode_generation"]
+                    or (
+                        generation == cached["episode_generation"]
+                        and frame_id < cached["source_frame_id"]
+                    )
                 )
             ):
                 continue
             accepted += 1
         if accepted:
-            batch_key = tuple(int(env_id) for env_id in env_ids)
+            batch_key: tuple[Any, ...] = tuple(int(env_id) for env_id in env_ids)
+            if preserve_all:
+                batch_key = (
+                    "preserve",
+                    tuple(int(env_id) for env_id in env_ids),
+                    tuple(int(value) for value in generations),
+                    tuple(int(value) for value in frame_ids),
+                )
             self.pending_batches[batch_key] = {
                 "inputs": inputs,
                 "signature": self._input_signature(inputs),
@@ -1785,6 +1819,7 @@ class Gr00tN1d7SemanticBackbonePolicy:
                 "published_wallclock_s": min(
                     (float(value) for value in wallclocks), default=time.time()
                 ),
+                "preserve_all": preserve_all,
             }
             self._prune_superseded_pending_locked()
         return {
@@ -1798,6 +1833,8 @@ class Gr00tN1d7SemanticBackbonePolicy:
             int, tuple[tuple[int, int, float], tuple[int, ...], int]
         ] = {}
         for batch_key, packet in self.pending_batches.items():
+            if packet.get("preserve_all", False):
+                continue
             for row, (env_id, generation, frame_id, wallclock_s) in enumerate(
                 zip(
                     packet["env_ids"],
@@ -1813,6 +1850,8 @@ class Gr00tN1d7SemanticBackbonePolicy:
                     latest_by_env[int(env_id)] = (version, batch_key, row)
 
         for batch_key, packet in list(self.pending_batches.items()):
+            if packet.get("preserve_all", False):
+                continue
             keep_rows = [
                 row
                 for row, env_id in enumerate(packet["env_ids"])
@@ -1850,6 +1889,15 @@ class Gr00tN1d7SemanticBackbonePolicy:
             )
         metadata = dict(request.get("metadata") or {})
         env_ids = tuple(int(value) for value in metadata["env_ids"])
+        preserve_all = bool(metadata.get("semantic_preserve_all", False))
+        batch_key: tuple[Any, ...] = env_ids
+        if preserve_all:
+            batch_key = (
+                "preserve",
+                env_ids,
+                tuple(int(value) for value in metadata["episode_generations"]),
+                tuple(int(value) for value in metadata["frame_ids"]),
+            )
         submitted_perf = time.perf_counter()
         preprocess_future = self._raw_preprocess_executor.submit(
             self._prepare_raw_observation, request["observation"]
@@ -1859,10 +1907,10 @@ class Gr00tN1d7SemanticBackbonePolicy:
                 lambda _: self.scheduler_wakeup_callback()
             )
         with self._cache_lock:
-            previous = self.pending_raw_batches.get(env_ids)
+            previous = self.pending_raw_batches.get(batch_key)
             if previous is not None:
                 previous["preprocess_future"].cancel()
-            self.pending_raw_batches[env_ids] = {
+            self.pending_raw_batches[batch_key] = {
                 "observation": request["observation"],
                 "metadata": metadata,
                 "published_wallclock_s": time.time(),
@@ -1934,7 +1982,14 @@ class Gr00tN1d7SemanticBackbonePolicy:
             float(explicit_priority),
             0.0 if urgent else 1.0,
             oldest_completion,
-            -float(packet["published_wallclock_s"]),
+            (
+                float(packet["published_wallclock_s"])
+                if packet.get(
+                    "preserve_all",
+                    packet.get("metadata", {}).get("semantic_preserve_all", False),
+                )
+                else -float(packet["published_wallclock_s"])
+            ),
         )
 
     def pending_env_counts(self) -> tuple[int, int]:
@@ -1963,11 +2018,11 @@ class Gr00tN1d7SemanticBackbonePolicy:
 
     @staticmethod
     def _select_pending_packets(
-        ordered: list[tuple[tuple[int, ...], dict[str, Any]]],
+        ordered: list[tuple[tuple[Any, ...], dict[str, Any]]],
         *,
         max_requests: int,
         max_envs: int,
-    ) -> list[tuple[tuple[int, ...], dict[str, Any]]]:
+    ) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
         selected = []
         selected_envs = 0
         for item in ordered:
@@ -2108,13 +2163,14 @@ class Gr00tN1d7SemanticBackbonePolicy:
                 generation = packet["episode_generations"][row]
                 frame_id = packet["source_frame_ids"][row]
                 cached = self.semantic_cache_by_env.get(env_id)
-                if cached is not None and (
+                is_older_than_latest = cached is not None and (
                     generation < cached["episode_generation"]
                     or (
                         generation == cached["episode_generation"]
                         and frame_id < cached["source_frame_id"]
                     )
-                ):
+                )
+                if is_older_than_latest and not packet.get("preserve_all", False):
                     output_row += 1
                     continue
                 self._semantic_version += 1
@@ -2131,6 +2187,10 @@ class Gr00tN1d7SemanticBackbonePolicy:
                     "forward_ms": forward_ms,
                     "batch_size": merged_env_count,
                 }
+                # Exact-age training and posthoc replay deliberately preserve
+                # historical observations. Raw preprocessing is concurrent, so
+                # frame N can complete after frame N+1. Keep N addressable in
+                # the bounded history without rolling the latest packet back.
                 self._store_semantic_cache_entry(env_id, cache_entry)
                 output_row += 1
         return merged_env_count

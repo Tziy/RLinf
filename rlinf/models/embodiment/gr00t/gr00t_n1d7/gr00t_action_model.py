@@ -63,6 +63,79 @@ def _tensor_fingerprint(tensor: torch.Tensor) -> str:
     return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:16]
 
 
+def _semantic_replay_fingerprint(
+    tensor: torch.Tensor, sample_count: int = 64
+) -> torch.Tensor:
+    """Return deterministic per-row samples used to audit PPO semantic replay."""
+    if tensor.ndim < 1:
+        raise ValueError("Semantic replay fingerprint requires a batched tensor")
+    flattened = tensor.detach().reshape(tensor.shape[0], -1)
+    if flattened.shape[1] == 0:
+        raise ValueError("Semantic replay fingerprint received an empty tensor")
+    count = min(int(sample_count), int(flattened.shape[1]))
+    indices = (
+        torch.linspace(
+            0,
+            flattened.shape[1] - 1,
+            steps=count,
+            device=flattened.device,
+        )
+        .round()
+        .to(torch.long)
+    )
+    return flattened.index_select(1, indices).float().contiguous()
+
+
+def _sampled_parameter_fingerprint(
+    model: torch.nn.Module,
+    prefixes: tuple[str, ...],
+    samples_per_parameter: int = 8,
+    trainable_only: bool = False,
+) -> str:
+    """Hash names, shapes, dtypes, and deterministic weight samples."""
+    digest = hashlib.sha256()
+    matched = 0
+    for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
+        if not any(name.startswith(prefix) for prefix in prefixes):
+            continue
+        if trainable_only and not parameter.requires_grad:
+            continue
+        matched += 1
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(parameter.shape)).encode("ascii"))
+        digest.update(str(parameter.dtype).encode("ascii"))
+        flattened = parameter.detach().reshape(-1)
+        if flattened.numel() == 0:
+            continue
+        count = min(int(samples_per_parameter), int(flattened.numel()))
+        indices = (
+            torch.linspace(
+                0,
+                flattened.numel() - 1,
+                steps=count,
+                device=flattened.device,
+            )
+            .round()
+            .to(torch.long)
+        )
+        samples = flattened.index_select(0, indices).float().cpu().numpy()
+        digest.update(samples.tobytes())
+    if matched == 0:
+        raise RuntimeError(f"No parameters matched fingerprint prefixes {prefixes}")
+    return digest.hexdigest()
+
+
+def _parameter_count(
+    model: torch.nn.Module, prefixes: tuple[str, ...], trainable_only: bool = False
+) -> int:
+    return sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if any(name.startswith(prefix) for prefix in prefixes)
+        and (not trainable_only or parameter.requires_grad)
+    )
+
+
 def _execution_action_prefix(
     actions: torch.Tensor, execution_horizon: int
 ) -> torch.Tensor:
@@ -323,10 +396,9 @@ def _resolve_gr00t_execution_mode(rl_head_config: dict[str, Any]) -> str:
             "drop_local_backbone=False"
         )
     if mode == "decoupled" and not semantic_enabled:
-        raise ValueError(
-            "decoupled execution requires semantic_server_enabled=True"
-        )
+        raise ValueError("decoupled execution requires semantic_server_enabled=True")
     return mode
+
 
 def _stale_age_gate(
     age_s: torch.Tensor, control_hz: float, threshold_frames: float
@@ -357,6 +429,19 @@ def _semantic_publish_due(
         if interval_frames > 0 and int(frame_id) - previous[1] >= interval_frames:
             return True
     return False
+
+
+def _semantic_generation_mismatch_count(
+    requested: list[int] | tuple[int, ...],
+    returned: list[int] | tuple[int, ...],
+) -> int:
+    """Count response rows that do not belong to the requested episodes."""
+    requested_values = [int(value) for value in requested]
+    returned_values = [int(value) for value in returned]
+    shared = min(len(requested_values), len(returned_values))
+    return abs(len(requested_values) - len(returned_values)) + sum(
+        requested_values[index] != returned_values[index] for index in range(shared)
+    )
 
 
 def _prepare_action_only_observation(
@@ -1202,7 +1287,9 @@ class FlowMatchingActionHeadForRLActionPrediction(Gr00tN1d7ActionHead):
             :, :, : self.action_chunk, : self.env_action_dim
         ]
         if compute_values:
-            packet_age = action_input.get("packet_age_s", action_input.get("packet_age"))
+            packet_age = action_input.get(
+                "packet_age_s", action_input.get("packet_age")
+            )
             values = self.get_value(vl_embs, state_features, packet_age)
             values = values[:, None]
         else:
@@ -1324,7 +1411,9 @@ class FlowMatchingActionHeadForRLActionPrediction(Gr00tN1d7ActionHead):
 
         chains_log_probs = torch.stack(chains_log_probs, dim=1)
         if compute_values:
-            packet_age = action_input.get("packet_age_s", action_input.get("packet_age"))
+            packet_age = action_input.get(
+                "packet_age_s", action_input.get("packet_age")
+            )
             chains_values = self.get_value(vl_embs, state_features, packet_age)
             chains_values = chains_values[:, None]
         else:
@@ -1556,9 +1645,41 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                 rl_head_config.get("semantic_fetch_target_age_frames", 0),
             )
         )
+        self._semantic_skip_latest_before_exact = bool(
+            rl_head_config.get("semantic_skip_latest_before_exact", False)
+        )
+        self._semantic_latest_fetch_skipped_count = 0
         self._semantic_eval_fixed_age_frames = int(
             rl_head_config.get("semantic_eval_fixed_age_frames", -1)
         )
+        configured_eval_horizon = int(rl_head_config.get("eval_execution_horizon", -1))
+        self._eval_execution_horizon = (
+            self.output_action_chunks
+            if configured_eval_horizon < 0
+            else configured_eval_horizon
+        )
+        if not 1 <= self._eval_execution_horizon <= self.output_action_chunks:
+            raise ValueError(
+                "eval_execution_horizon must be within the predicted action "
+                "horizon: "
+                f"{self._eval_execution_horizon=} "
+                f"predicted_horizon={self.output_action_chunks}"
+            )
+        configured_train_horizon = int(
+            rl_head_config.get("train_execution_horizon", -1)
+        )
+        self._train_execution_horizon = (
+            self.output_action_chunks
+            if configured_train_horizon < 0
+            else configured_train_horizon
+        )
+        if not 1 <= self._train_execution_horizon <= self.output_action_chunks:
+            raise ValueError(
+                "train_execution_horizon must be within the predicted action "
+                "horizon: "
+                f"{self._train_execution_horizon=} "
+                f"predicted_horizon={self.output_action_chunks}"
+            )
         self._semantic_eval_random_age_min_frames = int(
             rl_head_config.get("semantic_eval_random_age_min_frames", -1)
         )
@@ -1615,6 +1736,12 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
         self._rollout_reset_mask = None
         self._rollout_semantic_metadata: dict[str, torch.Tensor] = {}
         self._latest_semantic_metadata: dict[str, Any] = {}
+
+        self._posthoc_semantic_delay_bank_enabled = bool(
+            rl_head_config.get("posthoc_semantic_delay_bank_enabled", False)
+        )
+        self._posthoc_fresh_semantic_outputs: BatchFeature | None = None
+        self._posthoc_fresh_semantic_metadata: dict[str, Any] = {}
         self._local_backbone_dropped = bool(
             rl_head_config.get("drop_local_backbone", False)
         )
@@ -1627,6 +1754,11 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
         self._semantic_zero_action_history = bool(
             rl_head_config.get("semantic_zero_action_history", False)
         )
+        self._verify_semantic_replay = bool(
+            rl_head_config.get("verify_semantic_replay", False)
+        )
+        self._semantic_fingerprint_mismatch_count = 0
+        self._semantic_cross_episode_packet_mismatch_count = 0
         if (
             self._require_packet_age_input
             and self.action_head.packet_age_adapter is None
@@ -1801,6 +1933,72 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             self.config.no_split_modules,
         )
 
+    def emit_fdvla_parameter_audit(self, *, require_frozen_vlm: bool) -> str:
+        """Log parameter boundaries after Transformers materializes checkpoint weights."""
+        vlm_prefixes = ("backbone.",)
+        dit_prefixes = (
+            "action_head.model.",
+            "action_head.packet_age_adapter.",
+            "action_head.action_history_adapter.",
+            "action_head.stale_residual_adapter.",
+            "action_head.stale_semantic_token_adapter.",
+        )
+        value_prefixes = ("action_head.value_head.",)
+        vlm_total = _parameter_count(self, vlm_prefixes)
+        vlm_trainable = _parameter_count(self, vlm_prefixes, trainable_only=True)
+        dit_trainable = _parameter_count(self, dit_prefixes, trainable_only=True)
+        value_trainable = _parameter_count(self, value_prefixes, trainable_only=True)
+        if require_frozen_vlm and vlm_trainable:
+            raise RuntimeError(
+                f"VLM must be frozen, but {vlm_trainable} backbone parameters are trainable"
+            )
+        common_fingerprint = _sampled_parameter_fingerprint(
+            self,
+            prefixes=("action_head.model.",),
+        )
+        dit_fingerprint = _sampled_parameter_fingerprint(
+            self,
+            prefixes=dit_prefixes,
+            trainable_only=True,
+        )
+        value_fingerprint = (
+            _sampled_parameter_fingerprint(
+                self,
+                prefixes=value_prefixes,
+                trainable_only=True,
+            )
+            if value_trainable
+            else "absent"
+        )
+        all_trainable_fingerprint = _sampled_parameter_fingerprint(
+            self,
+            prefixes=("",),
+            trainable_only=True,
+        )
+        logger.info("VLM total parameter count: %d", vlm_total)
+        logger.info("VLM trainable parameter count: %d", vlm_trainable)
+        logger.info("DiT trainable parameter count: %d", dit_trainable)
+        logger.info("Value head trainable parameter count: %d", value_trainable)
+        logger.info(
+            "Shared initialization fingerprint (sampled SHA256): %s",
+            common_fingerprint,
+        )
+        logger.info(
+            "DiT initialization fingerprint (trainable sampled SHA256): %s",
+            dit_fingerprint,
+        )
+        logger.info(
+            "Value head initialization fingerprint (trainable sampled SHA256): %s",
+            value_fingerprint,
+        )
+        logger.info(
+            "All trainable initialization fingerprint (sampled SHA256): %s",
+            all_trainable_fingerprint,
+        )
+        if require_frozen_vlm:
+            logger.info("Frozen VLM parameter boundary verified")
+        return common_fingerprint
+
     def _load_modality_processor(
         self,
         modality_config: Optional[Any],
@@ -1886,6 +2084,29 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             ) * 1000.0
         self._rollout_profile_last = now
 
+    def _validate_semantic_episode_generations(
+        self,
+        requested_generations: list[int],
+        response_metadata: dict[str, Any],
+        *,
+        context: str,
+    ) -> None:
+        returned_generations = response_metadata.get("episode_generations", ())
+        mismatch_count = _semantic_generation_mismatch_count(
+            requested_generations, returned_generations
+        )
+        self._semantic_cross_episode_packet_mismatch_count = int(
+            getattr(self, "_semantic_cross_episode_packet_mismatch_count", 0)
+        ) + int(mismatch_count)
+        if mismatch_count:
+            raise RuntimeError(
+                f"{context} received cross-episode semantic packets: "
+                f"requested={requested_generations} "
+                f"returned={list(returned_generations)} "
+                f"total_mismatches="
+                f"{self._semantic_cross_episode_packet_mismatch_count}"
+            )
+
     @staticmethod
     def _check_state_is_batched(obs: dict[str, Any]) -> bool:
         """Return whether observation state tensors already carry a batch dim."""
@@ -1943,6 +2164,23 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
         **kwargs,
     ) -> dict[str, Any]:
         """Actor forward pass: recompute log-probs/values from cached rollouts."""
+        expected_semantic_fingerprint = forward_inputs.get(
+            "rollout_semantic_fingerprint"
+        )
+        semantic_tensor = forward_inputs.get("semantic_backbone_features")
+        if expected_semantic_fingerprint is not None and semantic_tensor is not None:
+            actual_semantic_fingerprint = _semantic_replay_fingerprint(semantic_tensor)
+            mismatch = actual_semantic_fingerprint.ne(
+                expected_semantic_fingerprint.to(actual_semantic_fingerprint)
+            ).any(dim=1)
+            mismatch_count = int(mismatch.sum().item())
+            self._semantic_fingerprint_mismatch_count += mismatch_count
+            if mismatch_count:
+                raise RuntimeError(
+                    "PPO semantic replay fingerprint mismatch: "
+                    f"batch_mismatches={mismatch_count} "
+                    f"total={self._semantic_fingerprint_mismatch_count}"
+                )
         normalized_input = _normalize_gr00t_forward_inputs(forward_inputs)
         semantic_keys = {
             key: key.removeprefix("semantic_")
@@ -2088,7 +2326,7 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
 
         raw_action = self.action_convert_fn(
             unnormalized_action,
-            chunk_size=self.output_action_chunks,
+            chunk_size=int(normalized_action.shape[1]),
         )
         raw_action = self._apply_exploration_noise(raw_action, mode)
         self._rollout_profile_mark("action_convert")
@@ -2362,7 +2600,15 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
     ) -> tuple[BatchFeature, torch.Tensor]:
         """Return the newest completed semantic packet without blocking after bootstrap."""
         if not self._semantic_enabled:
-            outputs = self.backbone(backbone_inputs)
+            # Cached-semantic SFT checkpoints are trained against the stable
+            # token axis used by the semantic server. Native coupled forward
+            # must preserve that contract as well; otherwise the same DiT sees
+            # a full local-VLM sequence in coupled mode but a resized packet in
+            # decoupled mode.
+            outputs = _resize_semantic_token_axis(
+                self.backbone(backbone_inputs),
+                getattr(self, "_semantic_feature_tokens", 0),
+            )
             age = torch.zeros(
                 outputs["backbone_features"].shape[0],
                 device=outputs["backbone_features"].device,
@@ -2584,6 +2830,11 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                     "Semantic server returned an invalid cache response: "
                     f"missing={sorted(missing_metadata)}, error={server_error}"
                 )
+            self._validate_semantic_episode_generations(
+                current_generations,
+                response_metadata,
+                context="Central semantic fetch",
+            )
             source_frames = torch.as_tensor(
                 response_metadata["source_frame_ids"],
                 device=outputs["backbone_features"].device,
@@ -2759,7 +3010,10 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             )
         random_min = getattr(self, "_semantic_train_random_age_min_frames", 0)
         invalid = [
-            age for age in requested_ages if age < random_min or age > random_max
+            age
+            for age, current_frame in zip(requested_ages, current_frames, strict=True)
+            if (age < random_min or age > random_max)
+            and not (current_frame == 0 and age == 0)
         ]
         if invalid:
             raise RuntimeError(
@@ -2822,6 +3076,11 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                 f"requested_age={requested_ages}"
             )
         outputs, response_metadata = fetched
+        self._validate_semantic_episode_generations(
+            generations,
+            response_metadata,
+            context="Exact-age semantic train",
+        )
         returned_source_frames = [
             int(value) for value in response_metadata.get("source_frame_ids", ())
         ]
@@ -2844,7 +3103,7 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
         outputs = _resize_semantic_token_axis(
             outputs, getattr(self, "_semantic_feature_tokens", 0)
         )
-        logger.info(
+        logger.debug(
             "Exact-age semantic train: requested_mean=%.2f actual_mean=%.2f "
             "current_mean=%.2f source_mean=%.2f",
             torch.tensor(requested_ages, dtype=torch.float32).mean().item(),
@@ -2912,6 +3171,11 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                 f"requested_age={requested_ages}"
             )
         outputs, response_metadata = fetched
+        self._validate_semantic_episode_generations(
+            generations,
+            response_metadata,
+            context="Exact-age semantic eval",
+        )
         returned_source_frames = [
             int(value) for value in response_metadata.get("source_frame_ids", ())
         ]
@@ -2920,8 +3184,14 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                 "Exact-age semantic eval received mismatched packets: "
                 f"requested={source_frames} returned={returned_source_frames}"
             )
+        # The exact packet is the semantic tensor actually consumed by the
+        # policy. Keep its metadata aligned with that tensor, especially when
+        # the optional preceding latest fetch is skipped. Otherwise a
+        # train-to-eval batch-size change can leave stale train metadata here.
+        self._latest_semantic_metadata = dict(response_metadata)
+
         next_current_frames = [
-            current_frame + int(self.output_action_chunks)
+            current_frame + int(self._eval_execution_horizon)
             for current_frame in current_frames
         ]
         next_requested_ages = self._requested_eval_semantic_age_frames(
@@ -2962,6 +3232,68 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                     "Exact-age semantic eval prefetched mismatched packets: "
                     f"requested={next_source_frames} returned={returned_next_sources}"
                 )
+
+        # Preserve the packet published during the chunk that just completed,
+        # even when a large requested age means it will not be consumed at the
+        # next action boundary. The raw-observation transport is deliberately
+        # latest-only. Without this retention fetch, K < age can let the next
+        # chunk replace a scheduled source observation before the semantic
+        # server has materialized it (for example K=1, age=2 loses frame 1).
+        # Waiting here keeps the controlled fixed-age evaluation exact; it does
+        # not change which historical packet is used for the current action.
+        if fixed_age >= 0:
+            execution_horizon = int(self._eval_execution_horizon)
+            remainder = int(fixed_age) % execution_horizon
+            publish_phase = (
+                execution_horizon if remainder == 0 else execution_horizon - remainder
+            )
+            retained_indices = []
+            retained_source_frames = []
+            for index, current_frame in enumerate(current_frames):
+                if current_frame < execution_horizon:
+                    continue
+                retained_source = current_frame - execution_horizon + publish_phase
+                if retained_source in (
+                    source_frames[index],
+                    next_source_frames[index],
+                ):
+                    continue
+                retained_indices.append(index)
+                retained_source_frames.append(retained_source)
+            if retained_indices:
+                retained = self._semantic_client.fetch_exact(
+                    env_ids=[env_ids[index] for index in retained_indices],
+                    episode_generations=[
+                        generations[index] for index in retained_indices
+                    ],
+                    source_frame_ids=retained_source_frames,
+                    max_wait_ms=self._semantic_eval_fixed_age_max_wait_ms,
+                    device=self.device,
+                    floating_dtype=self.compute_dtype,
+                )
+                if retained is None:
+                    raise RuntimeError(
+                        "Exact-age semantic eval could not retain scheduled packets: "
+                        f"current={[current_frames[index] for index in retained_indices]} "
+                        f"source={retained_source_frames} requested_age={fixed_age}"
+                    )
+                retained_generations = [
+                    generations[index] for index in retained_indices
+                ]
+                self._validate_semantic_episode_generations(
+                    retained_generations,
+                    retained[1],
+                    context="Exact-age semantic eval retention",
+                )
+                returned_retained_sources = [
+                    int(value) for value in retained[1].get("source_frame_ids", ())
+                ]
+                if returned_retained_sources != retained_source_frames:
+                    raise RuntimeError(
+                        "Exact-age semantic eval retained mismatched packets: "
+                        f"requested={retained_source_frames} "
+                        f"returned={returned_retained_sources}"
+                    )
         age_frames = torch.tensor(
             [
                 current_frame - source_frame
@@ -2982,8 +3314,113 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             torch.tensor(current_frames, dtype=torch.float32).mean().item(),
             torch.tensor(source_frames, dtype=torch.float32).mean().item(),
         )
-        age_s = torch.nextafter(age_frames / max(self._semantic_control_hz, 1e-6), torch.zeros_like(age_frames))
+        age_s = torch.nextafter(
+            age_frames / max(self._semantic_control_hz, 1e-6),
+            torch.zeros_like(age_frames),
+        )
         return outputs, age_s
+
+    def _semantic_for_action_mode(
+        self,
+        backbone_inputs: BatchFeature,
+        *,
+        mode: Literal["train", "eval"],
+    ) -> tuple[BatchFeature, torch.Tensor]:
+        """Fetch exactly one packet when an exact-age selector will replace latest."""
+        if mode == "train":
+            exact_age_enabled = (
+                getattr(self, "_semantic_train_random_age_max_frames", -1) >= 0
+            )
+            exact_selector = self._fixed_age_train_semantic
+        elif mode == "eval":
+            exact_age_enabled = (
+                getattr(self, "_semantic_eval_fixed_age_frames", -1) >= 0
+                or getattr(self, "_semantic_eval_random_age_max_frames", -1) >= 0
+            )
+            exact_selector = self._fixed_age_eval_semantic
+        else:
+            raise ValueError(f"Unsupported semantic action mode: {mode}")
+
+        bank_enabled = bool(
+            getattr(self, "_posthoc_semantic_delay_bank_enabled", False)
+        )
+        self._posthoc_fresh_semantic_outputs = None
+        self._posthoc_fresh_semantic_metadata = {}
+        skip_latest = (
+            bool(getattr(self, "_semantic_skip_latest_before_exact", False))
+            and self._semantic_enabled
+            and self._semantic_central_cache
+            and exact_age_enabled
+        )
+
+        if bank_enabled and mode == "train":
+            if not exact_age_enabled:
+                raise RuntimeError(
+                    "Posthoc semantic delay bank requires exact-age online training"
+                )
+        if skip_latest:
+            self._semantic_latest_fetch_skipped_count = (
+                int(getattr(self, "_semantic_latest_fetch_skipped_count", 0)) + 1
+            )
+            fallback_outputs = BatchFeature(data={})
+            fallback_age = torch.empty(0, device=self.device, dtype=self.compute_dtype)
+        else:
+            fallback_outputs, fallback_age = self._semantic_backbone(backbone_inputs)
+
+        if bank_enabled and mode == "train":
+            if not isinstance(self._semantic_client, Gr00tN1d7SemanticCacheClient):
+                raise RuntimeError(
+                    "Posthoc semantic delay bank requires the central semantic cache"
+                )
+            metadata = self._rollout_semantic_metadata
+            env_ids = [int(value) for value in metadata["env_ids"].tolist()]
+            generations = [
+                int(value) for value in metadata["episode_generations"].tolist()
+            ]
+            current_frames = [int(value) for value in metadata["frame_ids"].tolist()]
+            # The env publishes every action-boundary observation when PosthocAug
+            # is enabled. At the next boundary that packet is a hindsight age-0
+            # candidate for the previous state, without re-collecting interaction.
+            bank_source_frames = [
+                max(0, current_frame - self._train_execution_horizon)
+                for current_frame in current_frames
+            ]
+            fetched_bank = self._semantic_client.fetch_exact(
+                env_ids=env_ids,
+                episode_generations=generations,
+                source_frame_ids=bank_source_frames,
+                max_wait_ms=self._semantic_train_fixed_age_max_wait_ms,
+                device=self.device,
+                floating_dtype=self.compute_dtype,
+            )
+            if fetched_bank is None:
+                raise RuntimeError(
+                    "Posthoc hindsight semantic bank could not fetch previous "
+                    f"boundary packets: current={current_frames} "
+                    f"source={bank_source_frames}"
+                )
+            bank_outputs, bank_metadata = fetched_bank
+            self._validate_semantic_episode_generations(
+                generations,
+                bank_metadata,
+                context="Posthoc hindsight semantic bank",
+            )
+            returned_sources = [
+                int(value) for value in bank_metadata.get("source_frame_ids", ())
+            ]
+            if returned_sources != bank_source_frames:
+                raise RuntimeError(
+                    "Posthoc hindsight semantic bank received mismatched packets: "
+                    f"requested={bank_source_frames} returned={returned_sources}"
+                )
+            bank_outputs = _resize_semantic_token_axis(
+                bank_outputs, getattr(self, "_semantic_feature_tokens", 0)
+            )
+            self._posthoc_fresh_semantic_outputs = BatchFeature(
+                data={key: value.detach() for key, value in dict(bank_outputs).items()}
+            )
+            self._posthoc_fresh_semantic_metadata = dict(bank_metadata)
+        return exact_selector(fallback_outputs, fallback_age)
 
     def _current_action_history(
         self, batch_size: int, device: torch.device
@@ -3061,10 +3498,16 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             for row, key in enumerate(self._current_action_history_keys):
                 self._action_history_by_env[key] = self._action_history[row].detach()
 
-    def _append_executed_action_history(self, predicted_actions: torch.Tensor) -> None:
+    def _append_executed_action_history(
+        self,
+        predicted_actions: torch.Tensor,
+        execution_horizon: int | None = None,
+    ) -> None:
         """Append only the action prefix that will be sent to the environment."""
+        if execution_horizon is None:
+            execution_horizon = self.output_action_chunks
         executed_actions = _execution_action_prefix(
-            predicted_actions, self.output_action_chunks
+            predicted_actions, execution_horizon
         )
         self._append_action_history(executed_actions)
 
@@ -3078,13 +3521,13 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
 
         backbone_inputs, action_inputs = self.prepare_input(normalized_input)
         self._rollout_profile_mark("split_inputs")
+        semantic_fetch_started_wallclock_s = time.time()
         semantic_fetch_started = time.perf_counter()
-        backbone_outputs, packet_age = self._semantic_backbone(backbone_inputs)
-        if mode == "train":
-            backbone_outputs, packet_age = self._fixed_age_train_semantic(
-                backbone_outputs, packet_age
-            )
+        backbone_outputs, packet_age = self._semantic_for_action_mode(
+            backbone_inputs, mode=mode
+        )
         self._last_semantic_fetch_s = time.perf_counter() - semantic_fetch_started
+        semantic_fetch_completed_wallclock_s = time.time()
         self._rollout_profile_mark("semantic_fetch")
         batch_size = int(backbone_outputs["backbone_features"].shape[0])
         action_history = self._current_action_history(
@@ -3103,10 +3546,13 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             mode=mode,
         )
         self._rollout_profile_mark("action_head")
-        actions = _execution_action_prefix(
-            rlinf_outputs["actions"], self.output_action_chunks
+        execution_horizon = (
+            self._train_execution_horizon
+            if mode == "train"
+            else self._eval_execution_horizon
         )
-        self._append_executed_action_history(actions)
+        actions = _execution_action_prefix(rlinf_outputs["actions"], execution_horizon)
+        self._append_executed_action_history(actions, execution_horizon)
         if hasattr(self, "validate_data"):
             self.validate_data(action_head_outputs, backbone_outputs, is_training=False)
         actions = actions.float()
@@ -3120,12 +3566,24 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             f"semantic_{key}": value.detach()
             for key, value in dict(backbone_outputs).items()
         }
+        semantic_fingerprint_inputs = {}
+        if self._verify_semantic_replay:
+            semantic_fingerprint_inputs["rollout_semantic_fingerprint"] = (
+                _semantic_replay_fingerprint(backbone_outputs["backbone_features"])
+            )
         forward_inputs = {
             "chains": rlinf_outputs["chains"],
             "denoise_inds": rlinf_outputs["denoise_inds"],
             "rollout_normalized_executed_actions": actions.detach(),
+            "rollout_action_execution_horizon": torch.full(
+                (batch_size,),
+                execution_horizon,
+                dtype=torch.int64,
+                device=actions.device,
+            ),
             **stashed_forward_inputs,
             **semantic_forward_inputs,
+            **semantic_fingerprint_inputs,
         }
         if self._semantic_central_cache and self._latest_semantic_metadata:
             semantic_meta = self._latest_semantic_metadata
@@ -3153,6 +3611,18 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                         dtype=torch.float64,
                         device=actions.device,
                     ),
+                    "rollout_semantic_fetch_started_wallclock_s": torch.full(
+                        (batch_size,),
+                        semantic_fetch_started_wallclock_s,
+                        dtype=torch.float64,
+                        device=actions.device,
+                    ),
+                    "rollout_semantic_fetch_completed_wallclock_s": torch.full(
+                        (batch_size,),
+                        semantic_fetch_completed_wallclock_s,
+                        dtype=torch.float64,
+                        device=actions.device,
+                    ),
                     "action_frame_ids": self._rollout_semantic_metadata["frame_ids"].to(
                         actions.device
                     ),
@@ -3164,6 +3634,69 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                     ),
                 }
             )
+
+        if mode == "train" and self._posthoc_semantic_delay_bank_enabled:
+            fresh_outputs = self._posthoc_fresh_semantic_outputs
+            fresh_meta = self._posthoc_fresh_semantic_metadata
+            if fresh_outputs is None or not fresh_meta:
+                raise RuntimeError(
+                    "Posthoc semantic delay bank is enabled but latest packet is missing"
+                )
+            fresh_source_frames = torch.as_tensor(
+                fresh_meta["source_frame_ids"],
+                device=actions.device,
+                dtype=torch.int64,
+            )
+            fresh_generations = torch.as_tensor(
+                fresh_meta["episode_generations"],
+                device=actions.device,
+                dtype=torch.int64,
+            )
+            current_frames = self._rollout_semantic_metadata["frame_ids"].to(
+                actions.device, dtype=torch.int64
+            )
+            current_generations = self._rollout_semantic_metadata[
+                "episode_generations"
+            ].to(actions.device, dtype=torch.int64)
+            fresh_completed = torch.as_tensor(
+                fresh_meta["completed_wallclock_s"],
+                device=actions.device,
+                dtype=torch.float64,
+            )
+            fresh_valid = (
+                fresh_generations.eq(current_generations)
+                & fresh_source_frames.le(current_frames)
+                & fresh_completed.le(semantic_fetch_completed_wallclock_s + 1e-6)
+            )
+            forward_inputs.update(
+                {
+                    **{
+                        f"posthoc_fresh_semantic_{key}": value.detach()
+                        for key, value in dict(fresh_outputs).items()
+                    },
+                    "posthoc_fresh_semantic_env_ids": self._rollout_semantic_metadata[
+                        "env_ids"
+                    ].to(actions.device),
+                    "posthoc_fresh_semantic_episode_generations": fresh_generations,
+                    "posthoc_fresh_semantic_source_frame_ids": fresh_source_frames,
+                    "posthoc_fresh_semantic_versions": torch.as_tensor(
+                        fresh_meta["semantic_versions"],
+                        device=actions.device,
+                        dtype=torch.int64,
+                    ),
+                    "posthoc_fresh_semantic_source_wallclock_s": torch.as_tensor(
+                        fresh_meta["source_wallclock_s"],
+                        device=actions.device,
+                        dtype=torch.float64,
+                    ),
+                    "posthoc_fresh_semantic_completed_wallclock_s": fresh_completed,
+                    "posthoc_fresh_valid_mask": fresh_valid,
+                }
+            )
+            if self._verify_semantic_replay:
+                forward_inputs["posthoc_fresh_semantic_fingerprint"] = (
+                    _semantic_replay_fingerprint(fresh_outputs["backbone_features"])
+                )
         if "task_ids" in self._rollout_semantic_metadata:
             forward_inputs["rollout_task_ids"] = self._rollout_semantic_metadata[
                 "task_ids"
@@ -3225,6 +3758,12 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             raise RuntimeError(
                 f"eval seed count {len(seeds)} does not match batch size {batch_size}"
             )
+        condition_seeds = (
+            [base_seed] * batch_size if isinstance(base_seed, int) else base_seed
+        )
+        self._latest_eval_noise_seeds = torch.as_tensor(
+            condition_seeds, dtype=torch.int64, device=device
+        )
         sample_shape = (
             self.action_head.action_horizon,
             self.action_head.model_action_dim,
@@ -3252,10 +3791,10 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
         normalized_input = _normalize_gr00t_forward_inputs(normalized_input)
         backbone_inputs, action_inputs = self.prepare_input(normalized_input)
         semantic_fetch_started = time.perf_counter()
-        backbone_outputs, packet_age = self._semantic_backbone(backbone_inputs)
-        backbone_outputs, packet_age = self._fixed_age_eval_semantic(
-            backbone_outputs, packet_age
+        backbone_outputs, packet_age = self._semantic_for_action_mode(
+            backbone_inputs, mode="eval"
         )
+        audit_packet_age = packet_age.detach()
         self._last_semantic_fetch_s = time.perf_counter() - semantic_fetch_started
         batch_size = int(backbone_outputs["backbone_features"].shape[0])
         if self._semantic_zero_packet_age:
@@ -3278,7 +3817,7 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             initial_noise=initial_noise,
         )
         actions = _execution_action_prefix(
-            model_pred["action_pred"], self.output_action_chunks
+            model_pred["action_pred"], self._eval_execution_horizon
         )
         if bool(self.action_head.rl_config.get("eval_repro_diagnostics", False)):
             env_ids = self._rollout_semantic_metadata.get("env_ids")
@@ -3298,7 +3837,7 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                     generations,
                     frame_ids,
                 )
-        self._append_executed_action_history(actions)
+        self._append_action_history(actions)
         if hasattr(self, "validate_data"):
             self.validate_data(model_pred, backbone_outputs, is_training=False)
         actions = actions.float()
@@ -3324,6 +3863,9 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
             current_frames = self._rollout_semantic_metadata["frame_ids"].to(device)
             forward_inputs.update(
                 {
+                    "rollout_semantic_env_ids": self._rollout_semantic_metadata[
+                        "env_ids"
+                    ].to(device),
                     "rollout_semantic_source_frame_ids": torch.as_tensor(
                         metadata["source_frame_ids"], device=device
                     ),
@@ -3351,6 +3893,40 @@ class GR00T_N1_7_ForRLActionPrediction(Gr00tN1d7, BasePolicy):
                         device=device,
                     ),
                 }
+            )
+        audit_device = actions.device
+        if self._semantic_central_cache:
+            actual_age_frames = (
+                (audit_packet_age.float() * self._semantic_control_hz)
+                .round()
+                .to(device=audit_device, dtype=torch.int64)
+            )
+            target_age = self._rollout_semantic_metadata.get("target_age_frames")
+            requested_age_frames = (
+                target_age.to(device=audit_device, dtype=torch.int64)
+                if target_age is not None
+                else actual_age_frames
+            )
+        else:
+            actual_age_frames = torch.zeros(
+                actions.shape[0], device=audit_device, dtype=torch.int64
+            )
+            requested_age_frames = actual_age_frames
+        forward_inputs["rollout_semantic_actual_age_frames"] = actual_age_frames
+        forward_inputs["rollout_semantic_requested_age_frames"] = requested_age_frames
+        forward_inputs["rollout_semantic_bootstrap_clipped"] = (
+            requested_age_frames != actual_age_frames
+        )
+        forward_inputs["rollout_action_execution_horizon"] = torch.full(
+            (actions.shape[0],),
+            self._eval_execution_horizon,
+            device=audit_device,
+            dtype=torch.int64,
+        )
+        latest_noise_seeds = getattr(self, "_latest_eval_noise_seeds", None)
+        if latest_noise_seeds is not None:
+            forward_inputs["rollout_policy_noise_seeds"] = latest_noise_seeds.to(
+                audit_device
             )
         if "task_ids" in self._rollout_semantic_metadata:
             forward_inputs["rollout_task_ids"] = self._rollout_semantic_metadata[

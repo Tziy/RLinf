@@ -1,0 +1,38 @@
+env_type: libero
+task_suite_name: libero_10
+
+total_num_envs: null
+
+auto_reset: false
+ignore_terminations: false
+max_steps_per_rollout_epoch: 512
+max_episode_steps: 512
+use_fixed_reset_state_ids: true
+use_ordered_reset_state_ids: false
+
+# Strict simulator-terminal binary reward:
+#   r_t = 1 on the first success termination, 0 otherwise.
+use_rel_reward: false
+reward_coef: 1.0
+use_step_penalty: false
+
+reset_gripper_open: true
+is_eval: false
+
+seed: 0
+group_size: 1
+
+video_cfg:
+  save_video: false
+  info_on_video: true
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  camera_heights: 256
+  camera_widths: 256
+
+# Eval-only raw exports for the offline predictive-information probe. NPZ output
+# is required to be an absolute path outside this Git worktree.
+information_export:
+  enabled: ${oc.decode:${oc.env:FDVLA_INFORMATION_EXPORT,false}}
+  output_dir: ${oc.env:FDVLA_INFORMATION_RAW_DIR,""}

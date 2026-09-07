@@ -70,6 +70,31 @@ def test_resize_semantic_token_axis_stabilizes_ppo_replay(source_tokens):
         assert not resized["backbone_attention_mask"][:, source_tokens:].any()
 
 
+def test_coupled_local_backbone_uses_server_semantic_token_axis():
+    class Backbone(torch.nn.Module):
+        def forward(self, _inputs):
+            return BatchFeature(
+                data={
+                    "backbone_features": torch.ones(2, 570, 3),
+                    "backbone_attention_mask": torch.ones(2, 570, dtype=torch.bool),
+                    "image_mask": torch.ones(2, dtype=torch.bool),
+                }
+            )
+
+    model = object.__new__(GR00T_N1_7_ForRLActionPrediction)
+    torch.nn.Module.__init__(model)
+    model.backbone = Backbone()
+    model._semantic_enabled = False
+    model._semantic_feature_tokens = 160
+
+    outputs, age = model._semantic_backbone(BatchFeature(data={}))
+
+    assert outputs["backbone_features"].shape == (2, 160, 3)
+    assert outputs["backbone_attention_mask"].shape == (2, 160)
+    assert outputs["image_mask"].shape == (2,)
+    torch.testing.assert_close(age, torch.zeros(2))
+
+
 class _PendingPolicy:
     def __init__(
         self, ready: int, total: int, ready_envs: int = 0, total_envs: int = 0
@@ -476,8 +501,8 @@ def test_semantic_history_retains_previous_episode_for_ppo_replay():
 
     previous = packet(2, 16)
     current = packet(3, 0)
-    policy._store_semantic_cache_entry(4, previous)
     policy._store_semantic_cache_entry(4, current)
+    policy._store_semantic_cache_entry(4, previous)
 
     response = policy.fetch_exact(
         {
@@ -492,6 +517,50 @@ def test_semantic_history_retains_previous_episode_for_ppo_replay():
     assert response["metadata"]["episode_generations"] == [2]
     assert restored["backbone_features"].unique().item() == 216
     assert policy.semantic_cache_by_env[4] is current
+
+
+def test_preserved_older_frame_queues_after_newer_latest():
+    policy = object.__new__(Gr00tN1d7SemanticBackbonePolicy)
+    policy._cache_lock = threading.RLock()
+    policy.pending_batches = {}
+    policy.semantic_cache_by_env = {4: {"episode_generation": 0, "source_frame_id": 16}}
+
+    response = policy._queue_observations(
+        BatchFeature(data={"input_ids": torch.tensor([[12]])}),
+        {
+            "env_ids": [4],
+            "frame_ids": [12],
+            "episode_generations": [0],
+            "observation_wallclock_s": [time.time()],
+            "semantic_preserve_all": True,
+        },
+    )
+
+    assert response["accepted"] == 1
+    packet = next(iter(policy.pending_batches.values()))
+    assert packet["source_frame_ids"] == [12]
+    assert packet["preserve_all"] is True
+
+    latest = policy.semantic_cache_by_env[4]
+    latest.update(source_wallclock_s=time.time(), completed_wallclock_s=time.time())
+    policy.cache_history_size = 8
+    policy.semantic_cache_history_by_env = {4: deque([latest], maxlen=8)}
+    policy.pending_raw_batches = {}
+    policy.device = torch.device("cpu")
+    policy.torch_dtype = torch.float32
+    policy.transport_quantization = "none"
+    policy._fetch_priority = threading.Event()
+    policy.scheduler_pause_until_perf = 0.0
+    policy._forward_lock = threading.Lock()
+    policy._semantic_version = 0
+    policy.model = SimpleNamespace(
+        backbone=lambda inputs: BatchFeature(
+            data={"backbone_features": inputs["input_ids"][:, None, :].float()}
+        )
+    )
+    assert policy.process_pending(max_batch_size=1) == 1
+    assert policy.semantic_cache_by_env[4]["source_frame_id"] == 16
+    assert policy.semantic_cache_history_by_env[4][-1]["source_frame_id"] == 12
 
 
 def test_rpc_server_fetch_waits_overlap():
@@ -773,6 +842,39 @@ def test_raw_publish_replaces_pending_preprocess_future():
         policy._raw_preprocess_executor.shutdown(wait=True)
 
 
+def test_raw_publish_preserves_exact_frames_for_same_env_batch():
+    policy = object.__new__(Gr00tN1d7SemanticBackbonePolicy)
+    policy._cache_lock = threading.RLock()
+    policy.pending_raw_batches = {}
+    policy.scheduler_wakeup_callback = None
+    policy._raw_preprocess_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1
+    )
+    policy._prepare_raw_observation = lambda observation: observation
+
+    try:
+        for frame_id in (12, 16):
+            policy.publish_raw_observations(
+                {
+                    "observation": {"states": str(frame_id)},
+                    "metadata": {
+                        "env_ids": [1],
+                        "episode_generations": [0],
+                        "frame_ids": [frame_id],
+                        "semantic_preserve_all": True,
+                    },
+                }
+            )
+
+        assert len(policy.pending_raw_batches) == 2
+        assert {
+            packet["metadata"]["frame_ids"][0]
+            for packet in policy.pending_raw_batches.values()
+        } == {12, 16}
+    finally:
+        policy._raw_preprocess_executor.shutdown(wait=True)
+
+
 def test_raw_observation_publisher_drains_latest_queue_without_poll(monkeypatch):
     publisher = Gr00tN1d7RawObservationPublisher(host="127.0.0.1", port=6666)
     first_started = threading.Event()
@@ -807,6 +909,51 @@ def test_raw_observation_publisher_drains_latest_queue_without_poll(monkeypatch)
 
     assert calls == [8, 24]
     assert publisher.replaced_count == 2
+
+
+def test_raw_observation_publisher_preserves_fifo_when_requested(monkeypatch):
+    publisher = Gr00tN1d7RawObservationPublisher(host="127.0.0.1", port=6666)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    last_finished = threading.Event()
+    calls = []
+
+    def publish_worker(observation, metadata):
+        del observation
+        frame_id = metadata["frame_ids"][0]
+        calls.append(frame_id)
+        if frame_id == 8:
+            first_started.set()
+            assert release_first.wait(timeout=1.0)
+        if frame_id == 24:
+            last_finished.set()
+        return []
+
+    monkeypatch.setattr(publisher, "_worker", publish_worker)
+    try:
+        observation = {"states": torch.zeros(1, 1)}
+        publisher.publish(observation, {"env_ids": [1], "frame_ids": [8]})
+        assert first_started.wait(timeout=1.0)
+        publisher.publish(
+            observation,
+            {"env_ids": [1], "frame_ids": [16]},
+            preserve_all=True,
+        )
+        publisher.publish(
+            observation,
+            {"env_ids": [1], "frame_ids": [24]},
+            preserve_all=True,
+        )
+        release_first.set()
+
+        assert last_finished.wait(timeout=1.0)
+    finally:
+        release_first.set()
+        publisher.close()
+
+    assert calls == [8, 16, 24]
+    assert publisher.replaced_count == 0
+    assert publisher.preserved_count == 2
 
 
 def test_raw_observation_publisher_sends_shards_concurrently(monkeypatch):
@@ -1153,9 +1300,10 @@ def test_central_semantic_generation_repair_is_bounded_when_packet_is_missing():
     model.output_action_chunks = 16
     model.compute_dtype = torch.float32
 
-    outputs, _ = model._semantic_backbone(BatchFeature(data={}))
+    with pytest.raises(RuntimeError, match="cross-episode semantic packets"):
+        model._semantic_backbone(BatchFeature(data={}))
 
-    assert outputs["backbone_features"].unique().item() == 9.0
+    assert model._semantic_cross_episode_packet_mismatch_count == 1
     assert client.wait_calls == 6
     assert client.published == 3
     assert (
@@ -1579,7 +1727,7 @@ def test_stale_token_correction_is_identity_through_age_threshold():
     torch.testing.assert_close(corrected[1], torch.full_like(corrected[1], 4.0))
 
 
-def test_fixed_age_eval_fetches_exact_simulator_frames(monkeypatch):
+def test_fixed_age_eval_prefetch_uses_execution_not_prediction_horizon(monkeypatch):
     model = object.__new__(GR00T_N1_7_ForRLActionPrediction)
     torch.nn.Module.__init__(model)
     model.register_parameter("_test_parameter", torch.nn.Parameter(torch.zeros(1)))
@@ -1591,19 +1739,27 @@ def test_fixed_age_eval_fetches_exact_simulator_frames(monkeypatch):
     model._semantic_age_mode = "simulator"
     model._semantic_control_hz = 20.0
     model._semantic_feature_tokens = 0
-    model.output_action_chunks = 4
+    model.output_action_chunks = 16
+    model._eval_execution_horizon = 4
     model.compute_dtype = torch.float32
     model._rollout_semantic_metadata = {
         "env_ids": torch.tensor([1, 2, 3, 4]),
         "frame_ids": torch.tensor([0, 4, 8, 12]),
         "episode_generations": torch.tensor([0, 1, 2, 3]),
     }
+    model._latest_semantic_metadata = {
+        "source_frame_ids": list(range(20)),
+        "episode_generations": list(range(20)),
+    }
     captured = []
 
     def fetch_exact(**kwargs):
         captured.append(dict(kwargs))
         outputs = BatchFeature(data={"backbone_features": torch.ones(4, 2, 3)})
-        return outputs, {"source_frame_ids": kwargs["source_frame_ids"]}
+        return outputs, {
+            "source_frame_ids": kwargs["source_frame_ids"],
+            "episode_generations": kwargs["episode_generations"],
+        }
 
     monkeypatch.setattr(model._semantic_client, "fetch_exact", fetch_exact)
     fallback = BatchFeature(data={"backbone_features": torch.zeros(4, 2, 3)})
@@ -1616,6 +1772,60 @@ def test_fixed_age_eval_fetches_exact_simulator_frames(monkeypatch):
     assert captured[0]["max_wait_ms"] == 1234.0
     assert outputs["backbone_features"].unique().item() == 1.0
     torch.testing.assert_close(age_s, torch.tensor([0.0, 0.2, 0.3, 0.3]))
+
+    assert model._latest_semantic_metadata == {
+        "source_frame_ids": [0, 0, 2, 6],
+        "episode_generations": [0, 1, 2, 3],
+    }
+
+
+def test_fixed_age_eval_retains_each_scheduled_packet_when_age_exceeds_horizon(
+    monkeypatch,
+):
+    model = object.__new__(GR00T_N1_7_ForRLActionPrediction)
+    torch.nn.Module.__init__(model)
+    model.register_parameter("_test_parameter", torch.nn.Parameter(torch.zeros(1)))
+    model._semantic_enabled = True
+    model._semantic_central_cache = True
+    model._semantic_client = object.__new__(Gr00tN1d7SemanticCacheClient)
+    model._semantic_eval_fixed_age_frames = 2
+    model._semantic_eval_fixed_age_max_wait_ms = 1234.0
+    model._semantic_age_mode = "simulator"
+    model._semantic_control_hz = 20.0
+    model._semantic_feature_tokens = 0
+    model.output_action_chunks = 16
+    model._eval_execution_horizon = 1
+    model.compute_dtype = torch.float32
+    captured = []
+
+    def fetch_exact(**kwargs):
+        captured.append(dict(kwargs))
+        batch_size = len(kwargs["env_ids"])
+        outputs = BatchFeature(data={"backbone_features": torch.ones(batch_size, 2, 3)})
+        return outputs, {
+            "source_frame_ids": kwargs["source_frame_ids"],
+            "episode_generations": kwargs["episode_generations"],
+        }
+
+    monkeypatch.setattr(model._semantic_client, "fetch_exact", fetch_exact)
+    fallback = BatchFeature(data={"backbone_features": torch.zeros(1, 2, 3)})
+
+    model._rollout_semantic_metadata = {
+        "env_ids": torch.tensor([1]),
+        "frame_ids": torch.tensor([1]),
+        "episode_generations": torch.tensor([0]),
+    }
+    _, age_s = model._fixed_age_eval_semantic(fallback, torch.full((1,), 99.0))
+
+    assert [call["source_frame_ids"] for call in captured] == [[0], [1]]
+    torch.testing.assert_close(age_s, torch.tensor([0.05]))
+
+    captured.clear()
+    model._rollout_semantic_metadata["frame_ids"] = torch.tensor([2])
+    _, age_s = model._fixed_age_eval_semantic(fallback, torch.full((1,), 99.0))
+
+    assert [call["source_frame_ids"] for call in captured] == [[0], [1], [2]]
+    torch.testing.assert_close(age_s, torch.tensor([0.1]))
 
 
 def test_exact_age_train_uses_env_scheduled_packets(monkeypatch):
@@ -1646,6 +1856,7 @@ def test_exact_age_train_uses_env_scheduled_packets(monkeypatch):
         outputs = BatchFeature(data={"backbone_features": torch.ones(3, 2, 3)})
         return outputs, {
             "source_frame_ids": kwargs["source_frame_ids"],
+            "episode_generations": kwargs["episode_generations"],
             "semantic_versions": [11, 12, 13],
         }
 
@@ -1659,6 +1870,127 @@ def test_exact_age_train_uses_env_scheduled_packets(monkeypatch):
     assert outputs["backbone_features"].unique().item() == 1.0
     assert model._latest_semantic_metadata["semantic_versions"] == [11, 12, 13]
     torch.testing.assert_close(age_s, torch.tensor([0.0, 0.15, 0.3]))
+
+
+def test_exact_age_train_allows_initial_zero_age_below_random_min(monkeypatch):
+    model = object.__new__(GR00T_N1_7_ForRLActionPrediction)
+    torch.nn.Module.__init__(model)
+    model.register_parameter("_test_parameter", torch.nn.Parameter(torch.zeros(1)))
+    model._semantic_enabled = True
+    model._semantic_central_cache = True
+    model._semantic_client = object.__new__(Gr00tN1d7SemanticCacheClient)
+    model._semantic_train_random_age_min_frames = 2
+    model._semantic_train_random_age_max_frames = 6
+    model._semantic_train_fixed_age_max_wait_ms = 4321.0
+    model._semantic_age_mode = "simulator"
+    model._semantic_control_hz = 20.0
+    model._semantic_feature_tokens = 0
+    model.compute_dtype = torch.float32
+    model._latest_semantic_metadata = {}
+    model._rollout_semantic_metadata = {
+        "env_ids": torch.tensor([1]),
+        "frame_ids": torch.tensor([0]),
+        "episode_generations": torch.tensor([0]),
+        "target_age_frames": torch.tensor([0]),
+    }
+
+    def fetch_exact(**kwargs):
+        outputs = BatchFeature(data={"backbone_features": torch.ones(1, 2, 3)})
+        return outputs, {
+            "source_frame_ids": kwargs["source_frame_ids"],
+            "episode_generations": kwargs["episode_generations"],
+        }
+
+    monkeypatch.setattr(model._semantic_client, "fetch_exact", fetch_exact)
+    fallback = BatchFeature(data={"backbone_features": torch.zeros(1, 2, 3)})
+
+    _, age_s = model._fixed_age_train_semantic(fallback, torch.full((1,), 99.0))
+
+    torch.testing.assert_close(age_s, torch.tensor([0.0]))
+
+
+def test_exact_age_train_rejects_zero_age_below_random_min_after_bootstrap():
+    model = object.__new__(GR00T_N1_7_ForRLActionPrediction)
+    torch.nn.Module.__init__(model)
+    model._semantic_train_random_age_min_frames = 2
+    model._semantic_train_random_age_max_frames = 6
+    model._rollout_semantic_metadata = {
+        "target_age_frames": torch.tensor([0]),
+    }
+
+    with pytest.raises(RuntimeError, match="outside the configured range"):
+        model._requested_train_semantic_age_frames([1])
+
+
+def test_exact_age_single_fetch_skips_only_redundant_latest_packet(monkeypatch):
+    model = object.__new__(GR00T_N1_7_ForRLActionPrediction)
+    torch.nn.Module.__init__(model)
+    model.register_parameter(
+        "_device_anchor", torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+    )
+    model.compute_dtype = torch.float32
+    model._semantic_enabled = True
+    model._semantic_central_cache = True
+    model._semantic_skip_latest_before_exact = True
+    model._semantic_latest_fetch_skipped_count = 0
+    model._semantic_train_random_age_max_frames = 6
+    exact = BatchFeature(data={"backbone_features": torch.full((1, 2, 3), 7.0)})
+
+    def latest(_):
+        raise AssertionError("redundant latest packet must not be fetched")
+
+    def fixed(fallback, fallback_age):
+        assert dict(fallback) == {}
+        assert fallback_age.numel() == 0
+        return exact, torch.tensor([0.3])
+
+    monkeypatch.setattr(model, "_semantic_backbone", latest)
+    monkeypatch.setattr(model, "_fixed_age_train_semantic", fixed)
+
+    outputs, age = model._semantic_for_action_mode(BatchFeature(data={}), mode="train")
+
+    assert outputs is exact
+    torch.testing.assert_close(age, torch.tensor([0.3]))
+    assert model._semantic_latest_fetch_skipped_count == 1
+
+
+def test_exact_age_single_fetch_is_opt_in(monkeypatch):
+    model = object.__new__(GR00T_N1_7_ForRLActionPrediction)
+    torch.nn.Module.__init__(model)
+    model.register_parameter(
+        "_device_anchor", torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+    )
+    model.compute_dtype = torch.float32
+    model._semantic_enabled = True
+    model._semantic_central_cache = True
+    model._semantic_skip_latest_before_exact = False
+    model._semantic_latest_fetch_skipped_count = 0
+    model._semantic_train_random_age_max_frames = 6
+    latest_outputs = BatchFeature(
+        data={"backbone_features": torch.full((1, 2, 3), 2.0)}
+    )
+    exact_outputs = BatchFeature(data={"backbone_features": torch.full((1, 2, 3), 7.0)})
+    calls = []
+
+    def latest(_):
+        calls.append("latest")
+        return latest_outputs, torch.tensor([0.1])
+
+    def fixed(fallback, fallback_age):
+        calls.append("exact")
+        assert fallback is latest_outputs
+        torch.testing.assert_close(fallback_age, torch.tensor([0.1]))
+        return exact_outputs, torch.tensor([0.3])
+
+    monkeypatch.setattr(model, "_semantic_backbone", latest)
+    monkeypatch.setattr(model, "_fixed_age_train_semantic", fixed)
+
+    outputs, age = model._semantic_for_action_mode(BatchFeature(data={}), mode="train")
+
+    assert calls == ["latest", "exact"]
+    assert outputs is exact_outputs
+    torch.testing.assert_close(age, torch.tensor([0.3]))
+    assert model._semantic_latest_fetch_skipped_count == 0
 
 
 def test_fixed_age_eval_fails_closed_when_exact_packet_is_missing(monkeypatch):
@@ -1701,6 +2033,7 @@ def test_random_age_eval_is_bounded_and_reproducible(monkeypatch):
     model._semantic_control_hz = 20.0
     model._semantic_feature_tokens = 0
     model.output_action_chunks = 16
+    model._eval_execution_horizon = 16
     model.compute_dtype = torch.float32
     model._rollout_semantic_metadata = {
         "env_ids": torch.tensor([1]),
@@ -1713,7 +2046,10 @@ def test_random_age_eval_is_bounded_and_reproducible(monkeypatch):
     def fetch_exact(**kwargs):
         captured.append(dict(kwargs))
         outputs = BatchFeature(data={"backbone_features": torch.ones(1, 2, 3)})
-        return outputs, {"source_frame_ids": kwargs["source_frame_ids"]}
+        return outputs, {
+            "source_frame_ids": kwargs["source_frame_ids"],
+            "episode_generations": kwargs["episode_generations"],
+        }
 
     monkeypatch.setattr(model._semantic_client, "fetch_exact", fetch_exact)
     fallback = BatchFeature(data={"backbone_features": torch.zeros(1, 2, 3)})
@@ -2065,6 +2401,7 @@ def test_env_boundary_publish_uses_latest_frame_without_advancing_clock():
         torch.tensor([0, 16]),
     )
     assert captured["semantic_priority"] == 1
+    assert captured["semantic_mode"] == "train"
 
 
 def test_env_semantic_publisher_forwards_priority():
@@ -2095,6 +2432,39 @@ def test_env_semantic_publisher_forwards_priority():
 
     assert published["metadata"]["semantic_priority"] == 1
     assert published["metadata"]["frame_ids"] == [16, 16]
+
+
+def test_fixed_age_eval_does_not_force_train_publish_preservation():
+    calls = []
+
+    def publish(_observation, metadata, preserve_all=False):
+        calls.append((dict(metadata), preserve_all))
+
+    worker = object.__new__(EnvWorker)
+    worker._semantic_raw_publisher = SimpleNamespace(poll=lambda: None, publish=publish)
+    worker._semantic_preserve_all_publishes = True
+    worker._semantic_preserve_all_train_publishes = False
+    worker._semantic_preserve_all_eval_publishes = True
+    obs = {
+        "states": torch.zeros(1, 1),
+        "main_images": torch.zeros(1, 1),
+        "wrist_images": torch.zeros(1, 1),
+        "task_descriptions": np.array(["task"]),
+    }
+    base = {
+        "env_ids": torch.tensor([1]),
+        "frame_ids": torch.tensor([8]),
+        "episode_generations": torch.tensor([0]),
+        "observation_wallclock_s": torch.tensor([1.0]),
+    }
+
+    worker._publish_semantic_observation(obs, {**base, "semantic_mode": "train"})
+    worker._publish_semantic_observation(obs, {**base, "semantic_mode": "eval"})
+
+    assert "semantic_preserve_all" not in calls[0][0]
+    assert calls[0][1] is False
+    assert calls[1][0]["semantic_preserve_all"] is True
+    assert calls[1][1] is True
 
 
 def test_eval_semantic_schedule_resets_between_validations():

@@ -1084,7 +1084,12 @@ class LiberoEnv(gym.Env):
 
     def _calc_step_reward(self, terminations):
         step_penalty = -1 if self.use_step_penalty else 0
-        termination_bonus = self.cfg.reward_coef * terminations
+        # A LIBERO success can remain asserted while ``chunk_step`` executes the
+        # rest of an already sampled action prefix. Reward only the transition
+        # that first enters success; every episode must have at most one terminal
+        # bonus even when the simulator keeps returning termination=True.
+        first_success = np.asarray(terminations, dtype=bool) & ~self.success_once
+        termination_bonus = self.cfg.reward_coef * first_success
         reward = step_penalty + termination_bonus
 
         if self.use_rel_reward:

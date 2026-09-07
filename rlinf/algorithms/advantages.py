@@ -21,6 +21,13 @@ from rlinf.algorithms.utils import kl_penalty, safe_normalize
 from rlinf.utils.utils import masked_mean
 
 
+def select_gae_values_for_critic_warmup(
+    values: Optional[torch.Tensor], *, critic_warmup: bool
+) -> Optional[torch.Tensor]:
+    """Avoid bootstrapping GAE from an untrained value head during warmup."""
+    return None if critic_warmup else values
+
+
 def normalize_advantages_by_group(
     advantages: torch.Tensor,
     group_ids: torch.Tensor,
